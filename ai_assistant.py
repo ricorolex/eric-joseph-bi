@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
+from banking import bank_share, nearby_branches
 from data_sources import ALL_SECTORS, secret
 
 DEFAULT_CHAT_MODEL = "claude-haiku-5-5"    # fast and inexpensive for interactive chat
@@ -21,7 +22,8 @@ MAX_TOOL_ROUNDS = 6
 CHAT_MAX_TOKENS = 1200
 BRIEF_MAX_TOKENS = 1600
 
-PURPOSES = ["Site selection", "Recruiting & staffing", "B2B sales prospecting"]
+BANKING_PURPOSE = "Bank small-business strategy"
+PURPOSES = ["Site selection", "Recruiting & staffing", "B2B sales prospecting", BANKING_PURPOSE]
 
 
 def ai_enabled() -> bool:
@@ -67,6 +69,14 @@ POINTS = {
 ID_COLS = ["city", "county", "zip_code"]
 
 
+BANK_ID_COLS = ["rank", "city", "zip_code", "coverage", "top_bank"]
+BANK_METRICS = ["opportunity", "small_biz", "estab_lt5", "estab_5_19", "estab_20plus", "estab_total", "employees",
+                "small_biz_per_branch", "small_biz_per_10k_pop", "population", "branches_in_zip", "banks_in_zip",
+                "deposits_in_zip_m", "deposits_per_small_biz_k", "top_bank_share_pct", "deposit_hhi",
+                "branches_nearby", "deposits_nearby_m"]
+COVERAGE_LABELS = ["Underserved", "Balanced", "Saturated", "No branch in ZIP"]
+
+
 def _records(df: pd.DataFrame) -> list[dict]:
     return json.loads(df.round(2).to_json(orient="records"))  # NaN -> null, numpy -> python
 
@@ -83,6 +93,7 @@ class DataTools:
     weights_pct: dict
     sources: list[dict]             # [{"Source":..., "State":...}]
     table: pd.DataFrame = field(init=False)
+    banking: dict | None = None   # set by attach_banking(): table, branches, radius, small_def
 
     def __post_init__(self) -> None:
         d = self.scored.sort_values("BI_Score", ascending=False).reset_index(drop=True).copy()
@@ -100,6 +111,7 @@ class DataTools:
                      "max": round(float(t[c].max()), 2)}
                  for c in METRICS if c != "overall_rank" and t[c].notna().any()}
         return {
+            "banking": self._banking_summary(),
             "markets_in_dataset": len(t),
             "markets_passing_sidebar_filters": int(t["meets_sidebar_filters"].sum()),
             "selected_sector": self.sector,
@@ -151,9 +163,75 @@ class DataTools:
         return {"sector": name, "note": "location quotient; >1 = more concentrated than the U.S.",
                 "markets": _records(res.head(top_n))}
 
+    # -- banking tools (small businesses + FDIC branches by ZIP)
+    def attach_banking(self, ctx: dict | None) -> None:
+        self.banking = ctx
+
+    def _banking_summary(self) -> dict:
+        b = self.banking
+        if not b:
+            return {"available": False, "note": "Banking data is not loaded (needs live Census and FDIC data)."}
+        return {"available": True, "zips_analyzed": len(b["table"]), "competitor_radius_miles": b["radius"],
+                "small_business_definition": b["small_def"], "coverage_labels": COVERAGE_LABELS}
+
+    def _bank_table(self) -> pd.DataFrame:
+        if not self.banking:
+            raise ValueError("Banking data is not loaded. It needs live Census and FDIC data; ask the user to "
+                             "check the Data Sources tab.")
+        t = self.banking["table"].copy()
+        t["deposits_in_zip_m"] = t["deposits_in_zip"] / 1e6
+        t["deposits_nearby_m"] = t["deposits_nearby"] / 1e6
+        t["deposits_per_small_biz_k"] = t["deposits_per_small_biz"] / 1e3
+        return t
+
+    def query_banking_zips(self, filters: dict | None = None, coverage: str | None = None,
+                           sort_by: str = "opportunity", descending: bool = True, limit: int = 10) -> dict:
+        t = self._bank_table()
+        mask = pd.Series(True, index=t.index)
+        for col, bounds in (filters or {}).items():
+            if col not in BANK_METRICS:
+                raise ValueError(f"unknown metric '{col}'. Valid: {BANK_METRICS}")
+            if not isinstance(bounds, dict):
+                raise ValueError(f"filter for '{col}' must be an object with min and/or max")
+            if bounds.get("min") is not None:
+                mask &= t[col] >= float(bounds["min"])
+            if bounds.get("max") is not None:
+                mask &= t[col] <= float(bounds["max"])
+        if coverage:
+            if coverage not in COVERAGE_LABELS:
+                raise ValueError(f"coverage must be one of {COVERAGE_LABELS}")
+            mask &= t["coverage"] == coverage
+        if sort_by not in BANK_METRICS:
+            raise ValueError(f"unknown sort_by '{sort_by}'. Valid: {BANK_METRICS}")
+        res = t[mask].sort_values(sort_by, ascending=not descending)
+        limit = max(1, min(int(limit), 25))
+        return {"count_matching": int(mask.sum()), "small_business_definition": self.banking["small_def"],
+                "zips": _records(res.head(limit)[BANK_ID_COLS + BANK_METRICS])}
+
+    def get_zip_competitors(self, zip_code: str, radius_miles: float | None = None, limit: int = 12) -> dict:
+        t = self._bank_table()
+        row = t[t["zip_code"] == str(zip_code).strip()]
+        if row.empty:
+            raise ValueError(f"ZIP '{zip_code}' is not in the banking analysis. Available: {list(t['zip_code'])}")
+        row = row.iloc[0]
+        radius = float(min(max(radius_miles or self.banking["radius"], 1), 15))
+        branches = self.banking["branches"]
+        nb = nearby_branches(branches, row["latitude"], row["longitude"], radius)
+        scope = f"within {radius:g} miles"
+        if nb.empty:  # no coordinates: fall back to branches inside the ZIP itself
+            nb = branches[branches["zip5"] == row["zip_code"]].assign(distance_mi=float("nan")).sort_values(
+                "deposits_usd", ascending=False)
+            scope = "inside the ZIP only"
+        limit = max(1, min(int(limit), 25))
+        shown = nb.assign(deposits_m=nb["deposits_usd"] / 1e6)[["bank", "address", "city", "zip5", "distance_mi", "deposits_m"]]
+        return {"zip_code": row["zip_code"], "city": row["city"], "scope": scope, "branches_found": len(nb),
+                "branches": _records(shown.head(limit)),
+                "deposit_share_by_bank": _records(bank_share(nb).head(8)[["bank", "branches", "share_pct"]])}
+
     def execute(self, name: str, args: dict | None) -> dict:
         fns = {"describe_data": self.describe_data, "query_markets": self.query_markets,
-               "get_market": self.get_market, "get_sector_lq": self.get_sector_lq}
+               "get_market": self.get_market, "get_sector_lq": self.get_sector_lq,
+               "query_banking_zips": self.query_banking_zips, "get_zip_competitors": self.get_zip_competitors}
         if name not in fns:
             raise ValueError(f"unknown tool '{name}'")
         return fns[name](**(args or {}))
@@ -202,6 +280,38 @@ TOOLS = [
                          "properties": {"sector": {"type": "string"}, "top_n": {"type": "integer", "default": 17}},
                          "required": ["sector"]},
     },
+    {
+        "name": "query_banking_zips",
+        "description": "Small businesses and bank branches by ZIP code. Rows: city, zip_code, rank, coverage "
+                       "(Underserved / Balanced / Saturated / No branch in ZIP), top_bank, opportunity (0-100), "
+                       "small_biz, estab_* size counts, small_biz_per_branch, small_biz_per_10k_pop, population, "
+                       "branches_in_zip, banks_in_zip, deposits_in_zip_m ($ millions), deposits_per_small_biz_k, "
+                       "top_bank_share_pct, deposit_hhi, branches_nearby, deposits_nearby_m.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "filters": {"type": "object",
+                            "description": "Map of metric name to {min, max}. Example: {\"branches_in_zip\": {\"max\": 2}}. "
+                                           "Metrics: " + ", ".join(BANK_METRICS),
+                            "additionalProperties": {"type": "object",
+                                                     "properties": {"min": {"type": "number"}, "max": {"type": "number"}}}},
+                "coverage": {"type": "string", "enum": COVERAGE_LABELS},
+                "sort_by": {"type": "string", "enum": BANK_METRICS, "default": "opportunity"},
+                "descending": {"type": "boolean", "default": True},
+                "limit": {"type": "integer", "description": "Max rows, 1-25.", "default": 10},
+            },
+        },
+    },
+    {
+        "name": "get_zip_competitors",
+        "description": "Bank branches competing in and around one ZIP code: bank, address, distance in miles, branch "
+                       "deposits ($ millions) and deposit share by bank.",
+        "input_schema": {"type": "object",
+                         "properties": {"zip_code": {"type": "string"},
+                                        "radius_miles": {"type": "number", "description": "1-15; defaults to the tab setting."},
+                                        "limit": {"type": "integer", "default": 12}},
+                         "required": ["zip_code"]},
+    },
 ]
 
 # ------------------------------------------------------------------ chat
@@ -211,7 +321,9 @@ Rules:
 1. Every number you state about a market must come from a tool result in this conversation. Never estimate, \
 recall or invent statistics. If the tools cannot answer, say what is missing.
 2. Use describe_data if unsure what exists, query_markets to filter and rank, get_market for one market, and \
-get_sector_lq for industries other than the selected one.
+get_sector_lq for industries other than the selected one. For small businesses and bank branches by ZIP use \
+query_banking_zips and get_zip_competitors. small_biz counts employer establishments (locations), not companies, and \
+excludes sole proprietors; coverage labels are relative to the ZIPs analyzed; deposits are as booked at each branch.
 3. bi_score is relative to the markets in this dataset and depends on user-adjustable weights. Never present it as \
 an absolute measure of quality.
 4. Race and ethnicity data is intentionally unavailable to you. If asked to recommend or exclude markets based on race, \
@@ -225,7 +337,8 @@ suggestion.
 
 def chat_system_prompt(tools: DataTools) -> str:
     state = {"selected_sector": tools.sector, "sidebar_filters": tools.filters,
-             "score_weights_pct": tools.weights_pct, "data_sources": tools.sources}
+             "score_weights_pct": tools.weights_pct, "data_sources": tools.sources,
+             "banking": tools._banking_summary()}
     return CHAT_SYSTEM + "\n\nCurrent dashboard state:\n" + json.dumps(state)
 
 
@@ -275,6 +388,10 @@ scores are relative to this dataset, LQ and GDP are county-level, and that sideb
 ## Suggested next steps
 Three concrete diligence steps tailored to the purpose.
 
+If the JSON contains banking_top_zips, write the memo for a bank deciding where to focus small-business banking: \
+use those ZIPs (small businesses, branches, coverage label, deposits), explain that small_biz counts employer \
+establishments and coverage is relative to the ZIPs analyzed, and ignore the market-score fields.
+
 Do not make claims about race, ethnicity or other protected characteristics and do not recommend including or \
 excluding communities on those grounds. This is screening support, not legal or investment advice."""
 
@@ -282,7 +399,7 @@ excluding communities on those grounds. This is screening support, not legal or 
 def build_brief_payload(tools: DataTools, purpose: str, top_n: int = 5) -> dict:
     t = tools.table
     top = t[t["meets_sidebar_filters"]].head(top_n)
-    return {
+    payload = {
         "purpose": purpose,
         "sector": tools.sector,
         "sidebar_filters": tools.filters,
@@ -294,6 +411,10 @@ def build_brief_payload(tools: DataTools, purpose: str, top_n: int = 5) -> dict:
         "dataset_medians": {c: round(float(t[c].median()), 2) for c in METRICS
                             if c != "overall_rank" and t[c].notna().any()},
     }
+    if purpose == BANKING_PURPOSE and tools.banking:
+        payload["banking_top_zips"] = tools.query_banking_zips(limit=top_n)["zips"]
+        payload["banking_settings"] = tools._banking_summary()
+    return payload
 
 
 def generate_brief(client, model: str, tools: DataTools, purpose: str, top_n: int = 5) -> str:
