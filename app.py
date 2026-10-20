@@ -323,6 +323,7 @@ with tab_compare:
 # ------------------------------------------------------------------ BANKING
 with tab_bank:
     banking_ui.render()
+ai_tools.attach_banking(st.session_state.get("banking_ctx"))
 
 # ------------------------------------------------------------------ AI ANALYST
 with tab_ai:
@@ -370,12 +371,15 @@ with tab_ai:
                 "Which markets have bachelor's+ above 40% and income over $70k?",
                 "Rank the top 5 markets for healthcare concentration.",
                 f"Why is {top['city']} ranked first?",
-                "Compare Tampa and Orlando.",
+                "Which ZIPs have many small businesses but few bank branches?",
+                "Who are the main bank competitors in ZIP 33131?",
+                "Which ZIPs look saturated with bank branches?",
             ]
-            ex_cols = st.columns(len(examples))
-            for i, q in enumerate(examples):
-                if ex_cols[i].button(q, key=f"ex{i}", width="stretch"):
-                    st.session_state["pending_q"] = q
+            for row_start in range(0, len(examples), 3):
+                ex_cols = st.columns(3)
+                for j, q in enumerate(examples[row_start:row_start + 3]):
+                    if ex_cols[j].button(q, key=f"ex{row_start + j}", width="stretch"):
+                        st.session_state["pending_q"] = q
 
             for m in chat:
                 with st.chat_message(m["role"]):
