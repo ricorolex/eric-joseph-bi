@@ -20,10 +20,11 @@ DEFAULT_CHAT_MODEL = "claude-haiku-5-5"    # fast and inexpensive for interactiv
 DEFAULT_BRIEF_MODEL = "claude-sonnet-5-5"  # stronger writing for the long-form brief
 MAX_TOOL_ROUNDS = 6
 CHAT_MAX_TOKENS = 1200
-BRIEF_MAX_TOKENS = 1600
+BRIEF_MAX_TOKENS = 2200
 
 BANKING_PURPOSE = "Bank small-business strategy"
-PURPOSES = ["Site selection", "Recruiting & staffing", "B2B sales prospecting", BANKING_PURPOSE]
+NEWSLETTER_PURPOSE = "Newsletter article outline"
+PURPOSES = ["Site selection", "Recruiting & staffing", "B2B sales prospecting", BANKING_PURPOSE, NEWSLETTER_PURPOSE]
 
 
 def ai_enabled() -> bool:
@@ -408,6 +409,36 @@ Do not make claims about race, ethnicity or other protected characteristics and 
 excluding communities on those grounds. This is screening support, not legal or investment advice."""
 
 
+NEWSLETTER_SYSTEM = """You help an independent writer turn a Synoptic BI dashboard snapshot into a newsletter article \
+outline. You are given JSON produced by the app. Use ONLY numbers found in that JSON; never add outside statistics, \
+company news or history. Write in Markdown with exactly these sections:
+
+## Headline options
+Three headline ideas (specific and curious, not clickbait) and one subhead.
+## The hook
+A draft opening paragraph of about 80 words that starts with the most surprising number in the data.
+## Three findings
+Three findings. Each: a one-line claim, the exact supporting numbers from the JSON, and one sentence on why a reader \
+should care. If banking_top_zips is present, at least one finding should use it.
+## Suggested charts
+Which charts to use: "Markets ranked by score" (top markets), "Banking opportunity by ZIP" (only if banking data is present), \
+"Deposit share around the top ZIP" (only if banking data is present). One line on what each shows.
+## What the data cannot tell you
+Three honest limits (for example: scores are relative to this set; counts are employer locations, not companies; LQ \
+and GDP are county-level; branch deposits can reflect headquarters or online banking).
+## Fact-check list
+A bullet list of every number you used, with its source (Census, BLS, BEA or FDIC) so the writer can verify it.
+## Sources line
+One ready-to-paste line naming the sources and the data date, plus one sentence saying this is not financial or \
+investment advice.
+
+Rules: if any data source State is "Sample", say prominently at the top that the figures are illustrative and must \
+not be published as fact. Do not label any named bank's branch as failing or weak; say deposits are as booked and \
+can reflect headquarters or online banking. Do not make claims about race, ethnicity or other protected \
+characteristics, and do not rank places on those grounds. Leave the actual writing, opinions and voice to the writer: \
+this is an outline and a fact base, not a finished article."""
+
+
 def build_brief_payload(tools: DataTools, purpose: str, top_n: int = 5) -> dict:
     t = tools.table
     top = t[t["meets_sidebar_filters"]].head(top_n)
@@ -423,7 +454,7 @@ def build_brief_payload(tools: DataTools, purpose: str, top_n: int = 5) -> dict:
         "dataset_medians": {c: round(float(t[c].median()), 2) for c in METRICS
                             if c != "overall_rank" and t[c].notna().any()},
     }
-    if purpose == BANKING_PURPOSE and tools.banking:
+    if purpose in (BANKING_PURPOSE, NEWSLETTER_PURPOSE) and tools.banking:
         payload["banking_top_zips"] = tools.query_banking_zips(limit=top_n)["zips"]
         payload["banking_settings"] = tools._banking_summary()
     return payload
@@ -432,7 +463,8 @@ def build_brief_payload(tools: DataTools, purpose: str, top_n: int = 5) -> dict:
 def generate_brief(client, model: str, tools: DataTools, purpose: str, top_n: int = 5) -> str:
     payload = build_brief_payload(tools, purpose, top_n)
     resp = client.messages.create(
-        model=model, max_tokens=BRIEF_MAX_TOKENS, system=BRIEF_SYSTEM,
+        model=model, max_tokens=BRIEF_MAX_TOKENS,
+        system=NEWSLETTER_SYSTEM if purpose == NEWSLETTER_PURPOSE else BRIEF_SYSTEM,
         messages=[{"role": "user", "content": "Write the brief from this data:\n```json\n"
                                               + json.dumps(payload) + "\n```"}],
     )

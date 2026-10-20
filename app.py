@@ -11,6 +11,8 @@ import streamlit as st
 
 import banking_ui
 import batch_ui
+import charts as charts_mod
+from banking import bank_share, catchment_branches
 import memo as memo_mod
 from interpret import band, band_legend_html, driver_sentence, guide_market, rating
 from ai_assistant import (PURPOSES, DataTools, ai_enabled, brief_model, chat_model, generate_brief,
@@ -544,6 +546,50 @@ with tab_memo:
                            width="stretch")
         st.caption(f"Built at {mf['built']} from the settings you have now. Change a filter or weight, then build again "
                    "to refresh it.")
+
+    # ---- chart images for articles and slides
+    st.markdown("---")
+    st.markdown('<div class="section-title">📰 Charts for your article</div>'
+                '<div class="section-sub">Clean 1200 x 675 PNG images with the title, sources and data date built in, '
+                'ready to drop into a newsletter, post or slide. For writing help, choose '
+                '"Newsletter article outline" in the AI Analyst brief generator.</div>', unsafe_allow_html=True)
+    if not all_live:
+        st.warning("Some sources are on sample data. Do not publish these charts as fact until every source is live.")
+    if st.button("🖼️ Prepare chart images", key="chart_build"):
+        with st.spinner("Drawing charts…"):
+            try:
+                files = {"market_scores": charts_mod.market_scores_png(view, selected_sector, loaded_at)}
+                ctx_b = st.session_state.get("banking_ctx")
+                if ctx_b:
+                    tb = ctx_b["table"]
+                    files["banking_opportunity"] = charts_mod.banking_opportunity_png(
+                        tb, ctx_b["small_def"], ctx_b.get("catch_label", f'{ctx_b["radius"]} mi'), loaded_at)
+                    r0 = tb.iloc[0]
+                    ring0 = (ctx_b.get("catchments") or {}).get(r0["zip_code"])
+                    nb0 = catchment_branches(ctx_b["branches"], r0["latitude"], r0["longitude"], ctx_b["radius"], ring0)
+                    if not nb0.empty:
+                        hhi_txt = (f'{str(r0["hhi_label"]).lower()} (HHI {r0["hhi_used"]:,.0f})'
+                                   if pd.notna(r0["hhi_used"]) else "deposit concentration n/a")
+                        files["deposit_share"] = charts_mod.deposit_share_png(
+                            bank_share(nb0), f'{r0["city"]} ({r0["zip_code"]})',
+                            ctx_b.get("catch_label", f'{ctx_b["radius"]} mi'), hhi_txt, loaded_at)
+                st.session_state["chart_files"] = files
+            except Exception as exc:  # noqa: BLE001
+                st.session_state.pop("chart_files", None)
+                st.error(f"Could not draw the charts ({type(exc).__name__}: {exc}). If this mentions matplotlib, "
+                         "add matplotlib to requirements.txt.")
+    cf = st.session_state.get("chart_files")
+    if cf:
+        names = {"market_scores": "Markets ranked by score", "banking_opportunity": "Banking opportunity by ZIP",
+                 "deposit_share": "Deposit share around the top ZIP"}
+        for key, label in names.items():
+            if key in cf:
+                st.image(cf[key], caption=label, width="stretch")
+                st.download_button(f"⬇️ Download: {label}", cf[key], file_name=f"synoptic_bi_{key}.png",
+                                   mime="image/png", key=f"dl_{key}")
+        if "banking_opportunity" not in cf:
+            st.caption("Open the 🏦 Banking tab first to include the banking charts.")
+        st.caption("Charts show the settings you have right now. Re-prepare them after changing a filter or weight.")
 
 # ------------------------------------------------------------------ BRIEF
 with tab_brief:

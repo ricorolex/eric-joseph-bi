@@ -54,3 +54,6 @@ and add the secrets as environment variables (`APP_PASSWORD`, `CENSUS_API_KEY`, 
   are not geocoded. Opportunity is relative to the ZIPs in the upload.
 - **Memo tab**: builds a branded Word and PDF memo (uses your AI brief as the executive summary when one exists).
   Needs `python-docx` and `reportlab` (already in requirements.txt).
+- **Newsletter tools**: choose "Newsletter article outline" in the AI brief generator for headline options, a hook, three
+  findings with exact numbers, a fact-check list and a sources line. The Memo tab can also export PNG charts (needs
+  `matplotlib`, already in requirements.txt). Always verify numbers and publish only when every source is live.
