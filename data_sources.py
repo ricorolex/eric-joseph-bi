@@ -1,4 +1,4 @@
-"""Live data connectors for Eric Joseph BI.
+"""Live data connectors for Synoptic BI.
 
 Sources (all public):
   * U.S. Census Bureau ACS 5-year  -> income, education, race/ethnicity by ZIP (ZCTA)
@@ -22,7 +22,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-HEADERS = {"User-Agent": "EricJosephBI/1.0 (public economic data dashboard)"}
+HEADERS = {"User-Agent": "SynopticBI/1.0 (public economic data dashboard)"}
 TIMEOUT = 25
 
 ALL_SECTORS = [
@@ -88,7 +88,7 @@ def secret(name: str) -> str | None:
 def _headers() -> dict:
     """User-Agent for public APIs. BLS asks automated clients to include a contact: set BLS_CONTACT_EMAIL."""
     contact = secret("BLS_CONTACT_EMAIL")
-    ua = "EricJosephBI/1.0 (public economic data dashboard" + (f"; contact: {contact}" if contact else "") + ")"
+    ua = "SynopticBI/1.0 (public economic data dashboard" + (f"; contact: {contact}" if contact else "") + ")"
     return {"User-Agent": ua}
 
 
@@ -97,7 +97,7 @@ NEEDS_CENSUS_KEY = ("Census rejects requests that have no key. Get a free key (i
 
 
 def offline() -> bool:
-    return os.environ.get("EJBI_OFFLINE", "").lower() in ("1", "true", "yes")
+    return (os.environ.get("SYNOPTIC_OFFLINE") or os.environ.get("EJBI_OFFLINE") or "").lower() in ("1", "true", "yes")
 
 
 def _scrub(msg) -> str:
@@ -240,7 +240,7 @@ def load_all():
     # --- Census ACS
     acs, acs_year, acs_err = None, None, None
     if offline():
-        acs_err = "offline mode (EJBI_OFFLINE is set)"
+        acs_err = "offline mode (SYNOPTIC_OFFLINE is set)"
     else:
         try:
             acs, acs_year = fetch_acs(list(markets["zip_code"]), secret("CENSUS_API_KEY"))

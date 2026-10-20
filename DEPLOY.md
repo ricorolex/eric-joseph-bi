@@ -1,4 +1,4 @@
-# Eric Joseph BI: put it on the web
+# Synoptic BI: put it on the web
 
 ## Run locally first
 ```
@@ -41,3 +41,16 @@ and add the secrets as environment variables (`APP_PASSWORD`, `CENSUS_API_KEY`, 
 - Bank branches and deposits come from the FDIC Summary of Deposits (annual June 30 survey). No key is normally
   needed; if the tab reports an FDIC error, add a free api.data.gov key as `FDIC_API_KEY`.
 - You can type extra Florida ZIP codes into the tab to analyze any area.
+
+## New business features
+- **Presets** (sidebar): one click sets filters and weights for Banking expansion, Tech/professional hiring or Wealth
+  management. Population growth is not in the data, so GDP growth stands in for it.
+- **Drive-time areas** (Banking tab > Competitor area): needs a free `ORS_API_KEY` (openrouteservice.org). Free keys allow
+  about 20 isochrone requests a minute and 500 a day, so results are cached for a week; the first load of 17+ ZIPs can take a
+  minute. Without a key the app keeps using straight-line radius.
+- **Competitor vulnerability**: deposit capture index (100 = median ZIP), deposit HHI with plain-English bands, and branch
+  outliers (under half or over twice the median branch in the area). HHI is informational, not an antitrust finding.
+- **Batch tab**: upload a CSV (or paste a list) of up to 60 Florida ZIPs or addresses. Only the ZIP is used; street addresses
+  are not geocoded. Opportunity is relative to the ZIPs in the upload.
+- **Memo tab**: builds a branded Word and PDF memo (uses your AI brief as the executive summary when one exists).
+  Needs `python-docx` and `reportlab` (already in requirements.txt).

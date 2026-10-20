@@ -1,4 +1,4 @@
-"""AI layer for Eric Joseph BI: a data-grounded chat analyst and a brief generator.
+"""AI layer for Synoptic BI: a data-grounded chat analyst and a brief generator.
 
 Design rules
   * The app computes every number. Claude only reads tool results / the JSON we hand it and
@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
-from banking import bank_share, nearby_branches
+from banking import bank_share, branch_outliers, catchment_branches
 from data_sources import ALL_SECTORS, secret
 
 DEFAULT_CHAT_MODEL = "claude-haiku-5-5"    # fast and inexpensive for interactive chat
@@ -69,16 +69,25 @@ POINTS = {
 ID_COLS = ["city", "county", "zip_code"]
 
 
-BANK_ID_COLS = ["rank", "city", "zip_code", "coverage", "top_bank"]
+BANK_ID_COLS = ["rank", "city", "zip_code", "coverage", "top_bank", "capture_label", "hhi_label"]
 BANK_METRICS = ["opportunity", "small_biz", "estab_lt5", "estab_5_19", "estab_20plus", "estab_total", "employees",
                 "small_biz_per_branch", "small_biz_per_10k_pop", "population", "branches_in_zip", "banks_in_zip",
                 "deposits_in_zip_m", "deposits_per_small_biz_k", "top_bank_share_pct", "deposit_hhi",
-                "branches_nearby", "deposits_nearby_m"]
+                "branches_nearby", "deposits_nearby_m", "capture_index", "hhi_used", "underperforming_branches"]
 COVERAGE_LABELS = ["Underserved", "Balanced", "Saturated", "No branch in ZIP"]
 
 
 def _records(df: pd.DataFrame) -> list[dict]:
     return json.loads(df.round(2).to_json(orient="records"))  # NaN -> null, numpy -> python
+
+
+def _outliers(nb: pd.DataFrame, limit: int = 6) -> pd.DataFrame:
+    """Branches far below or above the median branch in the area (deposits in $ millions)."""
+    if nb is None or nb.empty:
+        return pd.DataFrame(columns=["flag", "bank", "address", "deposits_m", "vs_median"])
+    o = branch_outliers(nb)
+    o = o[o["flag"] != "In line"].assign(deposits_m=lambda d: d["deposits_usd"] / 1e6, vs_median=lambda d: d["vs_peer"])
+    return o.sort_values("vs_median").head(limit)[["flag", "bank", "address", "deposits_m", "vs_median"]]
 
 
 @dataclass
@@ -171,7 +180,7 @@ class DataTools:
         b = self.banking
         if not b:
             return {"available": False, "note": "Banking data is not loaded (needs live Census and FDIC data)."}
-        return {"available": True, "zips_analyzed": len(b["table"]), "competitor_radius_miles": b["radius"],
+        return {"available": True, "zips_analyzed": len(b["table"]), "competitor_radius_miles": b["radius"], "competitor_area": b.get("catch_label", f'{b["radius"]} mi'),
                 "small_business_definition": b["small_def"], "coverage_labels": COVERAGE_LABELS}
 
     def _bank_table(self) -> pd.DataFrame:
@@ -216,8 +225,9 @@ class DataTools:
         row = row.iloc[0]
         radius = float(min(max(radius_miles or self.banking["radius"], 1), 15))
         branches = self.banking["branches"]
-        nb = nearby_branches(branches, row["latitude"], row["longitude"], radius)
-        scope = f"within {radius:g} miles"
+        ring = None if radius_miles else (self.banking.get("catchments") or {}).get(row["zip_code"])
+        nb = catchment_branches(branches, row["latitude"], row["longitude"], radius, ring)
+        scope = (f"within a {self.banking.get('catch_label')} area" if ring else f"within {radius:g} miles")
         if nb.empty:  # no coordinates: fall back to branches inside the ZIP itself
             nb = branches[branches["zip5"] == row["zip_code"]].assign(distance_mi=float("nan")).sort_values(
                 "deposits_usd", ascending=False)
@@ -226,7 +236,8 @@ class DataTools:
         shown = nb.assign(deposits_m=nb["deposits_usd"] / 1e6)[["bank", "address", "city", "zip5", "distance_mi", "deposits_m"]]
         return {"zip_code": row["zip_code"], "city": row["city"], "scope": scope, "branches_found": len(nb),
                 "branches": _records(shown.head(limit)),
-                "deposit_share_by_bank": _records(bank_share(nb).head(8)[["bank", "branches", "share_pct"]])}
+                "deposit_share_by_bank": _records(bank_share(nb).head(8)[["bank", "branches", "share_pct"]]),
+                "branch_outliers": _records(_outliers(nb))}
 
     def execute(self, name: str, args: dict | None) -> dict:
         fns = {"describe_data": self.describe_data, "query_markets": self.query_markets,
@@ -286,7 +297,7 @@ TOOLS = [
                        "(Underserved / Balanced / Saturated / No branch in ZIP), top_bank, opportunity (0-100), "
                        "small_biz, estab_* size counts, small_biz_per_branch, small_biz_per_10k_pop, population, "
                        "branches_in_zip, banks_in_zip, deposits_in_zip_m ($ millions), deposits_per_small_biz_k, "
-                       "top_bank_share_pct, deposit_hhi, branches_nearby, deposits_nearby_m.",
+                       "top_bank_share_pct, deposit_hhi, branches_nearby, deposits_nearby_m, capture_index (deposits per small business, 100 = median ZIP; under 60 = Under-captured), hhi_used and hhi_label (deposit concentration in the competitor area), underperforming_branches (branches under half the median branch).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -305,7 +316,8 @@ TOOLS = [
     {
         "name": "get_zip_competitors",
         "description": "Bank branches competing in and around one ZIP code: bank, address, distance in miles, branch "
-                       "deposits ($ millions) and deposit share by bank.",
+                       "deposits ($ millions), deposit share by bank, and branch_outliers (branches far below or above the median "
+                       "branch in the area; overperformers are often headquarters or online-booked, so say that).",
         "input_schema": {"type": "object",
                          "properties": {"zip_code": {"type": "string"},
                                         "radius_miles": {"type": "number", "description": "1-15; defaults to the tab setting."},
@@ -315,7 +327,7 @@ TOOLS = [
 ]
 
 # ------------------------------------------------------------------ chat
-CHAT_SYSTEM = """You are the AI analyst inside Eric Joseph BI, a Florida market-screening dashboard.
+CHAT_SYSTEM = """You are the AI analyst inside Synoptic BI, a Florida market-screening dashboard.
 
 Rules:
 1. Every number you state about a market must come from a tool result in this conversation. Never estimate, \
@@ -373,7 +385,7 @@ def run_chat(client, model: str, tools: DataTools, history: list[dict]) -> dict:
 
 
 # ------------------------------------------------------------------ brief
-BRIEF_SYSTEM = """You write concise market-screening briefs for Eric Joseph BI, a Florida market-intelligence \
+BRIEF_SYSTEM = """You write concise market-screening briefs for Synoptic BI, a Florida market-intelligence \
 dashboard. You are given JSON produced by the app. Use ONLY numbers found in that JSON; never add outside \
 statistics. Write in Markdown, roughly 400-500 words, with these sections:
 

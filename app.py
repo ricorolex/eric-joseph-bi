@@ -1,5 +1,6 @@
 import hmac
 import json
+from datetime import datetime
 from html import escape
 
 import altair as alt
@@ -9,11 +10,13 @@ import pydeck as pdk
 import streamlit as st
 
 import banking_ui
+import batch_ui
+import memo as memo_mod
 from ai_assistant import (PURPOSES, DataTools, ai_enabled, brief_model, chat_model, generate_brief,
                           get_client, run_chat)
 from data_sources import ALL_SECTORS, load_all, offline, run_diagnostics, secret
 
-st.set_page_config(page_title="Eric Joseph BI", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Synoptic BI", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
 
 NAVY, TEAL, SLATE = "#0b1f3a", "#0e7490", "#64748b"
 
@@ -36,11 +39,14 @@ html, body, [class*="css"], .stApp { font-family: 'Inter', system-ui, sans-serif
 .kpi-label { font-size:.74rem; text-transform:uppercase; letter-spacing:.08em; color:#64748b; font-weight:600; }
 .kpi-value { font-size:1.65rem; font-weight:800; color:#0b1f3a; margin-top:2px; }
 .kpi-sub { font-size:.82rem; color:#0e7490; font-weight:500; }
-.section-title { font-size:1.15rem; font-weight:700; color:#0b1f3a; margin: 6px 0 2px 0; }
-.section-sub { font-size:.88rem; color:#64748b; margin-bottom:10px; }
-.stTabs [data-baseweb="tab-list"] { gap: 6px; }
-.stTabs [data-baseweb="tab"] { background:#fff; border:1px solid #e5eaf1; border-radius:10px 10px 0 0; padding: 8px 18px; font-weight:600; }
-.stTabs [aria-selected="true"] { background:#0b1f3a; color:#fff; }
+.section-title { font-size:1.15rem; font-weight:700; color:inherit; margin: 6px 0 2px 0; }  /* follows light/dark theme */
+.section-sub { font-size:.88rem; color:inherit; opacity:.78; margin-bottom:10px; }
+.stTabs { margin-top: 1.5rem; margin-bottom: 1rem; }
+.stTabs [data-baseweb="tab-list"] { gap: 6px; padding-bottom: 4px; }
+.stTabs [data-baseweb="tab"] { background:#fff; border:1px solid #e5eaf1; border-radius:10px 10px 0 0; padding: 8px 18px; font-weight:600; color:#0b1f3a; }
+.stTabs [aria-selected="true"] { background:#0b1f3a; color:#fff !important; }
+.stTabs [aria-selected="true"] p, .stTabs [data-baseweb="tab"] p { color:inherit !important; }
+.kpi-row-gap { height: .5rem; }
 .site-footer { text-align:center; color:#94a3b8; font-size:.8rem; margin-top:36px; }
 </style>
 """,
@@ -51,7 +57,7 @@ html, body, [class*="css"], .stApp { font-family: 'Inter', system-ui, sans-serif
 def hero(pills: str = "") -> None:
     st.markdown(
         f'<div class="hero"><div class="hero-eyebrow">FLORIDA MARKET INTELLIGENCE</div>'
-        f'<div class="hero-title">Eric Joseph BI</div>'
+        f'<div class="hero-title">Synoptic BI</div>'
         f'<div class="hero-sub">Live economic, workforce and demographic signals to screen Florida markets for expansion, '
         f'hiring and sales.</div>{pills}</div>',
         unsafe_allow_html=True,
@@ -87,15 +93,46 @@ pill_html = (
 hero(pill_html)
 
 # ------------------------------------------------------------------ sidebar
+# One-click role presets. Each sets every slider so the result is predictable. Banking sliders live in the Banking tab.
+PRESETS = {
+    "Custom (my own settings)": None,
+    "🏦 Banking expansion": {
+        "w_lq": 0, "w_gdp": 40, "w_inc": 30, "w_edu": 30, "income_floor": 40000, "bachelor_floor": 15,
+        "bk_w1": 20, "bk_w2": 50, "bk_w3": 30,
+        "note": "Banking tab: 50% under-served gap (businesses per branch), 30% small-business density, 20% volume. "
+                "Markets: growth and income weighted. (ZIP-level income growth is not in the data, so GDP growth stands in.)"},
+    "💼 Tech / professional hiring": {
+        "w_lq": 20, "w_gdp": 30, "w_inc": 0, "w_edu": 50, "income_floor": 30000, "bachelor_floor": 25,
+        "note": "50% bachelor's+ attainment, 30% GDP growth, 20% sector concentration. Minimum bachelor's 25%."},
+    "💎 Wealth management": {
+        "w_lq": 0, "w_gdp": 40, "w_inc": 60, "w_edu": 0, "income_floor": 140000, "bachelor_floor": 0,
+        "note": "60% median income (minimum $140k), 40% growth. Population growth is not in the data, so GDP growth "
+                "stands in for it."},
+}
+
+
+def _apply_preset() -> None:
+    cfg = PRESETS.get(st.session_state.get("preset"))
+    if cfg:
+        for k, v in cfg.items():
+            if k != "note":
+                st.session_state[k] = v
+
+
 st.sidebar.markdown("### 🎛️ Filters")
+st.sidebar.selectbox("🎯 Scoring preset", list(PRESETS), key="preset", on_change=_apply_preset,
+                     help="One click sets the filters and weights for a type of buyer. You can still fine-tune them.")
+_note = (PRESETS.get(st.session_state.get("preset")) or {}).get("note")
+if _note:
+    st.sidebar.caption(_note)
 selected_sector = st.sidebar.selectbox("Industry sector", ALL_SECTORS, index=11)
-income_floor = st.sidebar.slider("Minimum median income ($)", 30000, 150000, 40000, step=5000)
-bachelor_floor = st.sidebar.slider("Minimum bachelor's degree (%)", 0, 50, 15)
+income_floor = st.sidebar.slider("Minimum median income ($)", 30000, 150000, 40000, step=5000, key="income_floor")
+bachelor_floor = st.sidebar.slider("Minimum bachelor's degree (%)", 0, 50, 15, key="bachelor_floor")
 with st.sidebar.expander("⚖️ Scoring weights", expanded=False):
-    w_lq = st.slider("Sector concentration (LQ)", 0, 100, 30)
-    w_gdp = st.slider("GDP growth", 0, 100, 20)
-    w_inc = st.slider("Median income", 0, 100, 30)
-    w_edu = st.slider("Education (bachelor's+)", 0, 100, 20)
+    w_lq = st.slider("Sector concentration (LQ)", 0, 100, 30, key="w_lq")
+    w_gdp = st.slider("GDP growth", 0, 100, 20, key="w_gdp")
+    w_inc = st.slider("Median income", 0, 100, 30, key="w_inc")
+    w_edu = st.slider("Education (bachelor's+)", 0, 100, 20, key="w_edu")
 if st.sidebar.button("🔄 Refresh live data", width="stretch"):
     st.cache_data.clear()
     st.rerun()
@@ -160,8 +197,9 @@ k3.markdown(kpi("Avg median income", f'${view["median_income"].mean():,.0f}', "a
 k4.markdown(kpi("Avg GDP growth", f'{view["gdp_growth_pct"].mean():.1f}%', "county-level"), unsafe_allow_html=True)
 st.write("")
 
-tab_over, tab_matrix, tab_compare, tab_bank, tab_ai, tab_brief, tab_src = st.tabs(
-    ["📍 Overview", "🧮 Market Matrix", "⚖️ Compare", "🏦 Banking", "🤖 AI Analyst", "📖 Brief", "🔌 Data Sources"]
+tab_over, tab_matrix, tab_compare, tab_bank, tab_batch, tab_ai, tab_memo, tab_brief, tab_src = st.tabs(
+    ["📍 Overview", "🧮 Market Matrix", "⚖️ Compare", "🏦 Banking", "📥 Batch", "🤖 AI Analyst", "📄 Memo",
+     "📖 Brief", "🔌 Data Sources"]
 )
 
 # Read-only data tools the AI can query. Race/ethnicity columns are never passed to it.
@@ -290,7 +328,7 @@ with tab_matrix:
     st.caption(f"{len(mx)} markets · Sector: {selected_sector} · LQ and GDP are county-level, so ZIPs in the same "
                "county share a value. Hispanic/Latino is an ethnicity measured separately from race.")
     st.download_button("⬇️ Download this view (CSV)", mx[cols].to_csv(index=False).encode(),
-                       file_name="eric_joseph_bi_markets.csv", mime="text/csv")
+                       file_name="synoptic_bi_markets.csv", mime="text/csv")
 
 # ------------------------------------------------------------------ COMPARE
 with tab_compare:
@@ -325,6 +363,10 @@ with tab_bank:
     banking_ui.render()
 ai_tools.attach_banking(st.session_state.get("banking_ctx"))
 
+# ------------------------------------------------------------------ BATCH
+with tab_batch:
+    batch_ui.render()
+
 # ------------------------------------------------------------------ AI ANALYST
 with tab_ai:
     st.markdown('<div class="section-title">AI Analyst</div>'
@@ -336,6 +378,13 @@ with tab_ai:
                 "(create a key in the Claude Console). See DEPLOY.md for where secrets go.")
     else:
         client = get_client()
+        if not ai_tools.banking:
+            st.warning("Bank questions can't be answered yet because the banking data isn't loaded. Reason:")
+            bs = st.session_state.get("banking_status")
+            if bs is not None:
+                st.dataframe(bs, hide_index=True, width="stretch")
+            else:
+                st.caption("Open the 🏦 Banking tab once, then come back.")
         sub_brief, sub_chat = st.tabs(["📝 Brief generator", "💬 Ask the data"])
 
         # ---- Brief generator
@@ -359,8 +408,16 @@ with tab_ai:
                 with st.container(border=True):
                     st.markdown(saved["text"])
                 st.caption(f"AI-generated from dashboard figures: {saved['label']}. Verify before acting on it.")
-                st.download_button("⬇️ Download brief (Markdown)", saved["text"].encode(),
-                                   file_name="eric_joseph_bi_brief.md", mime="text/markdown")
+                dl1, dl2 = st.columns(2)
+                dl1.download_button("⬇️ Download brief (Word .docx)",
+                                    memo_mod.build_brief_docx(saved["text"], saved["label"],
+                                                              [f"{r.Source}: {r.State}" for r in status[["Source", "State"]].itertuples()],
+                                                              loaded_at),
+                                    file_name="synoptic_bi_brief.docx",
+                                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                    width="stretch")
+                dl2.download_button("⬇️ Download brief (Markdown)", saved["text"].encode(),
+                                    file_name="synoptic_bi_brief.md", mime="text/markdown", width="stretch")
 
         # ---- Ask the data
         with sub_chat:
@@ -419,10 +476,54 @@ with tab_ai:
                 st.session_state["ai_chat"] = []
                 st.rerun()
 
+# ------------------------------------------------------------------ MEMO
+with tab_memo:
+    st.markdown('<div class="section-title">Board-ready memo</div>'
+                '<div class="section-sub">One click turns the current view into a branded Word and PDF memo: executive '
+                'summary, macro scorecard, sector mix, bank-branch analysis and a compliance note.</div>',
+                unsafe_allow_html=True)
+    saved_brief = st.session_state.get("brief")
+    m1, m2 = st.columns([3, 2])
+    prepared_for = m1.text_input("Prepared for (optional)", placeholder="e.g. Investment Committee, Q4 expansion review",
+                                 key="memo_for")
+    n_mk = m2.slider("Markets to include", 3, max(3, min(12, len(view))), min(8, max(3, len(view))), key="memo_n")
+    if saved_brief:
+        st.success(f"Executive summary will use your AI brief: {saved_brief['label']}")
+    elif ai_enabled():
+        st.info("No AI brief yet. Generate one in the 🤖 AI Analyst tab first for a written executive summary; "
+                "otherwise the memo is built from the data tables alone.")
+    else:
+        st.info("The AI Analyst is off, so the memo is built from the data tables alone. Add ANTHROPIC_API_KEY to "
+                "include a written executive summary.")
+    if "banking_ctx" not in st.session_state:
+        st.caption("The banking section is included only when the 🏦 Banking tab has loaded.")
+    if st.button("📄 Build memo files", type="primary", key="memo_build"):
+        with st.spinner("Building your memo…"):
+            try:
+                purpose_lbl = saved_brief["label"].split(" · ")[0] if saved_brief else "Market screening"
+                payload = memo_mod.collect(view, sector_lq, selected_sector, weights_pct, filters_state, loaded_at, status,
+                                           st.session_state.get("banking_ctx"), saved_brief["text"] if saved_brief else None,
+                                           purpose_lbl, prepared_for, top_n=n_mk)
+                st.session_state["memo_files"] = {"docx": memo_mod.build_docx(payload), "pdf": memo_mod.build_pdf(payload),
+                                                  "built": datetime.now().strftime("%H:%M")}
+            except Exception as exc:  # noqa: BLE001
+                st.session_state.pop("memo_files", None)
+                st.error(f"Could not build the memo ({type(exc).__name__}: {exc}). "
+                         "If this mentions a missing module, add python-docx and reportlab to requirements.txt.")
+    mf = st.session_state.get("memo_files")
+    if mf:
+        d1, d2 = st.columns(2)
+        d1.download_button("⬇️ Download Word (.docx)", mf["docx"], file_name="synoptic_bi_memo.docx",
+                           mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", width="stretch")
+        d2.download_button("⬇️ Download PDF", mf["pdf"], file_name="synoptic_bi_memo.pdf", mime="application/pdf",
+                           width="stretch")
+        st.caption(f"Built at {mf['built']} from the settings you have now. Change a filter or weight, then build again "
+                   "to refresh it.")
+
 # ------------------------------------------------------------------ BRIEF
 with tab_brief:
     st.markdown('<div class="section-title">How to use this platform</div>', unsafe_allow_html=True)
-    st.info("Eric Joseph BI combines public economic and demographic indicators into one transparent score to "
+    st.info("Synoptic BI combines public economic and demographic indicators into one transparent score to "
             "support early-stage market screening. It supports, and does not replace, on-the-ground due diligence.")
     b1, b2 = st.columns(2, gap="large")
     with b1:
@@ -460,7 +561,7 @@ with tab_src:
     st.dataframe(status, hide_index=True, width="stretch",
                  column_config={"State": st.column_config.TextColumn("State", width="small")})
     if offline():
-        st.info("Offline mode is on (EJBI_OFFLINE). Live fetching is disabled.")
+        st.info("Offline mode is on (SYNOPTIC_OFFLINE). Live fetching is disabled.")
     st.markdown(
         "**Make everything live**\n"
         "- **Census (ACS and Business Patterns):** a free key is REQUIRED; Census rejects requests without one. "
@@ -486,6 +587,6 @@ with tab_src:
     if "diag" in st.session_state:
         st.dataframe(st.session_state["diag"], hide_index=True, width="stretch")
 
-st.markdown('<div class="site-footer">© Eric Joseph BI · Data: U.S. Census Bureau (ACS), Bureau of Labor Statistics '
+st.markdown('<div class="site-footer">© Synoptic BI · Data: U.S. Census Bureau (ACS), Bureau of Labor Statistics '
             '(QCEW), Bureau of Economic Analysis. For informational purposes only; not legal or investment advice.</div>',
             unsafe_allow_html=True)
