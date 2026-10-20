@@ -85,13 +85,30 @@ def secret(name: str) -> str | None:
     return value or os.environ.get(name)
 
 
+def _headers() -> dict:
+    """User-Agent for public APIs. BLS asks automated clients to include a contact: set BLS_CONTACT_EMAIL."""
+    contact = secret("BLS_CONTACT_EMAIL")
+    ua = "EricJosephBI/1.0 (public economic data dashboard" + (f"; contact: {contact}" if contact else "") + ")"
+    return {"User-Agent": ua}
+
+
+NEEDS_CENSUS_KEY = ("Census rejects requests that have no key. Get a free key (instant, by email) at "
+                    "api.census.gov/data/key_signup.html and set CENSUS_API_KEY.")
+
+
 def offline() -> bool:
     return os.environ.get("EJBI_OFFLINE", "").lower() in ("1", "true", "yes")
+
+
+def _scrub(msg) -> str:
+    """Hide API keys that HTTP libraries echo back inside error messages (key=..., UserID=...)."""
+    return re.sub(r"(key|UserID)=[^&\s'\")]+", r"\1=***", str(msg), flags=re.I)
 
 
 # ---------------------------------------------------------------- Census ACS
 ACS_VARS = [
     "B19013_001E",                                                    # median household income
+    "B01003_001E",                                                    # total population
     "B15003_001E", "B15003_021E", "B15003_022E", "B15003_023E",       # edu: total, assoc, bach, masters
     "B15003_024E", "B15003_025E",                                     # edu: professional, doctorate
     "B03002_001E", "B03002_003E", "B03002_004E", "B03002_006E", "B03002_012E",  # race/ethnicity
@@ -112,6 +129,7 @@ def parse_acs(rows: list[list[str]]) -> pd.DataFrame:
     return pd.DataFrame({
         "zip_code": df["zip code tabulation area"].astype(str),
         "median_income": df["B19013_001E"],
+        "population": df["B01003_001E"],
         "edu_associate_pct": _pct(df["B15003_021E"], edu_total),
         "edu_bachelor_pct": _pct(df["B15003_022E"], edu_total),
         "edu_graduate_pct": _pct(df["B15003_023E"] + df["B15003_024E"] + df["B15003_025E"], edu_total),
@@ -123,6 +141,8 @@ def parse_acs(rows: list[list[str]]) -> pd.DataFrame:
 
 
 def fetch_acs(zips: list[str], api_key: str | None) -> tuple[pd.DataFrame, int]:
+    if not api_key:
+        raise RuntimeError(NEEDS_CENSUS_KEY)
     last_err: Exception | None = None
     for year in (2024, 2023, 2022):  # newest release that responds wins
         query = {"get": "NAME," + ",".join(ACS_VARS),
@@ -131,7 +151,7 @@ def fetch_acs(zips: list[str], api_key: str | None) -> tuple[pd.DataFrame, int]:
             query["key"] = api_key
         url = f"https://api.census.gov/data/{year}/acs/acs5?" + urlencode(query, quote_via=quote, safe=",:")
         try:
-            r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+            r = requests.get(url, headers=_headers(), timeout=TIMEOUT)
             r.raise_for_status()
             return parse_acs(r.json()), year
         except Exception as exc:  # noqa: BLE001
@@ -156,7 +176,7 @@ def parse_qcew(text: str) -> pd.Series:
 def _fetch_qcew_county(fips: str) -> tuple[str, pd.Series, int]:
     for year in (2025, 2024, 2023):
         url = f"https://data.bls.gov/cew/data/api/{year}/a/area/{fips}.csv"
-        r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        r = requests.get(url, headers=_headers(), timeout=TIMEOUT)
         if r.status_code == 200 and r.text.strip():
             return fips, parse_qcew(r.text), year
     raise RuntimeError(f"no QCEW annual file for county {fips}")
@@ -182,7 +202,7 @@ def fetch_qcew(fips_list: list[str]) -> tuple[dict[str, pd.Series], int]:
 def fetch_bea_gdp_growth(api_key: str) -> tuple[pd.Series, str]:
     params = {"UserID": api_key, "method": "GetData", "datasetname": "Regional", "TableName": "CAGDP9",
               "LineCode": "1", "GeoFips": "COUNTY", "Year": "LAST5", "ResultFormat": "JSON"}
-    r = requests.get("https://apps.bea.gov/api/data", params=params, headers=HEADERS, timeout=TIMEOUT)
+    r = requests.get("https://apps.bea.gov/api/data", params=params, headers=_headers(), timeout=TIMEOUT)
     r.raise_for_status()
     try:
         data = r.json()["BEAAPI"]["Results"]["Data"]
@@ -225,7 +245,7 @@ def load_all():
         try:
             acs, acs_year = fetch_acs(list(markets["zip_code"]), secret("CENSUS_API_KEY"))
         except Exception as exc:  # noqa: BLE001
-            acs_err = str(exc)
+            acs_err = _scrub(exc)
     if acs is not None:
         df = markets.merge(acs, on="zip_code", how="left")
         status.append({"Source": "Census ACS 5-year", "Feeds": "Income, education, race/ethnicity",
@@ -247,7 +267,7 @@ def load_all():
         try:
             gdp, span = fetch_bea_gdp_growth(bea_key)
         except Exception as exc:  # noqa: BLE001
-            gdp_note = str(exc)
+            gdp_note = _scrub(exc)
     if gdp is not None:
         df["gdp_growth_pct"] = df["fips"].map(gdp)
         status.append({"Source": "BEA Regional (CAGDP9)", "Feeds": "County real GDP growth",
@@ -265,7 +285,7 @@ def load_all():
         try:
             qcew, qcew_year = fetch_qcew(sorted(df["fips"].unique()))
         except Exception as exc:  # noqa: BLE001
-            qcew_err = str(exc)
+            qcew_err = _scrub(exc)
     if qcew is not None:
         rows = []
         for z, fips in zip(df["zip_code"], df["fips"]):
@@ -286,3 +306,234 @@ def load_all():
     df = df.dropna(subset=["median_income", "edu_bachelor_pct"]).reset_index(drop=True)
     loaded_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     return df, sector_lq, pd.DataFrame(status), loaded_at
+
+
+# ---------------------------------------------------------------- Census CBP (small business by ZIP)
+CBP_YEARS = (2024, 2023, 2022)  # newest release that responds wins
+
+
+def _size_bucket(label: str) -> str | None:
+    """Classify a CBP employment-size label without relying on numeric size codes."""
+    low = str(label).lower().strip()
+    if low.startswith("all"):
+        return "total"
+    nums = [int(n.replace(",", "")) for n in re.findall(r"\d[\d,]*", low)]
+    if not nums:
+        return None
+    if "less than" in low or "fewer than" in low or nums[0] < 5:
+        return "lt5"
+    if nums[0] in (5, 10):
+        return "5_19"
+    return "20plus"
+
+
+def parse_cbp(rows: list[list[str]]) -> pd.DataFrame:
+    """Census CBP rows (all sectors, all legal forms, by size class) -> one row per ZIP."""
+    df = pd.DataFrame(rows[1:], columns=rows[0])
+    zip_col = "zip code" if "zip code" in df.columns else "ZIPCODE"
+    df["zip_code"] = df[zip_col].astype(str).str.zfill(5)
+    for c in ("ESTAB", "EMP", "PAYANN"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["bucket"] = df["EMPSZES_LABEL"].map(_size_bucket)
+    est = df.pivot_table(index="zip_code", columns="bucket", values="ESTAB", aggfunc="sum").reindex(
+        columns=["total", "lt5", "5_19", "20plus"])
+    tot = df[df["bucket"] == "total"].set_index("zip_code")
+    out = pd.DataFrame({
+        "estab_total": est["total"], "estab_lt5": est["lt5"], "estab_5_19": est["5_19"],
+        "estab_20plus": est["20plus"],
+        "employees": tot["EMP"], "payroll_k": tot["PAYANN"],
+    }).reset_index()
+    return out
+
+
+def fetch_cbp(zips: list[str], api_key: str | None) -> tuple[pd.DataFrame, int]:
+    if not api_key:
+        raise RuntimeError(NEEDS_CENSUS_KEY)
+    last_err: Exception | None = None
+    for year in CBP_YEARS:
+        query = {"get": "ESTAB,EMP,PAYANN,EMPSZES,EMPSZES_LABEL",
+                 "for": "zip code:" + ",".join(zips), "NAICS2017": "00", "LFO": "001", "key": api_key}
+        url = f"https://api.census.gov/data/{year}/cbp?" + urlencode(query, quote_via=quote, safe=",:")
+        try:
+            r = requests.get(url, headers=_headers(), timeout=TIMEOUT)
+            r.raise_for_status()
+            return parse_cbp(r.json()), year
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+    raise RuntimeError(f"Census CBP request failed ({last_err})")
+
+
+# ---------------------------------------------------------------- FDIC Summary of Deposits (branches)
+FDIC_SOD_URL = "https://api.fdic.gov/banks/sod"
+
+
+def _first_col(df: pd.DataFrame, names: tuple[str, ...]) -> str | None:
+    return next((n for n in names if n in df.columns), None)
+
+
+def parse_fdic(rows: list[dict]) -> pd.DataFrame:
+    """Normalize raw FDIC SOD records into one tidy branch table."""
+    df = pd.DataFrame(rows)
+    zip_c = _first_col(df, ("ZIPBR", "ZIP"))
+    dep_c = _first_col(df, ("DEPSUMBR",))
+    bank_c = _first_col(df, ("NAMEFULL", "NAME", "NAMEBR"))
+    if not (zip_c and dep_c and bank_c):
+        raise ValueError("FDIC response is missing expected fields (need a ZIP, DEPSUMBR and a bank name). "
+                         f"Columns returned: {sorted(df.columns)[:25]}")
+    lat_c = _first_col(df, ("SIMS_LATITUDE", "LATITUDE"))
+    lon_c = _first_col(df, ("SIMS_LONGITUDE", "LONGITUDE"))
+    addr_c = _first_col(df, ("ADDRESBR", "ADDRESS"))
+    city_c = _first_col(df, ("CITYBR", "CITY"))
+    cert_c = _first_col(df, ("CERT",))
+    out = pd.DataFrame({
+        "bank": df[bank_c].astype(str).str.strip(),
+        "cert": df[cert_c] if cert_c else None,
+        "address": df[addr_c] if addr_c else "",
+        "city": df[city_c] if city_c else "",
+        "zip5": df[zip_c].astype(str).str.extract(r"(\d{5})")[0],
+        "lat": pd.to_numeric(df[lat_c], errors="coerce") if lat_c else np.nan,
+        "lon": pd.to_numeric(df[lon_c], errors="coerce") if lon_c else np.nan,
+        "deposits_usd": pd.to_numeric(df[dep_c], errors="coerce").fillna(0) * 1000,  # DEPSUMBR is in $ thousands
+    })
+    dedupe = [c for c in ("ID",) if c in df.columns]
+    if dedupe:
+        out = out.loc[~df.duplicated(subset=dedupe)]
+    return out.dropna(subset=["zip5"]).reset_index(drop=True)
+
+
+def fetch_fdic_sod(state: str = "FL", api_key: str | None = None) -> tuple[pd.DataFrame, int]:
+    """All branches in a state for the newest Summary of Deposits year (June 30 survey)."""
+    this_year = datetime.now(timezone.utc).year
+    last_err: Exception | None = None
+    for year in (this_year, this_year - 1, this_year - 2):
+        try:
+            rows, offset = [], 0
+            while True:
+                params = {"filters": f"YEAR:{year} AND STALPBR:{state}", "limit": 10000, "offset": offset}
+                if api_key:
+                    params["api_key"] = api_key
+                r = requests.get(FDIC_SOD_URL, params=params, headers=_headers(), timeout=60)
+                r.raise_for_status()
+                js = r.json()
+                batch = [(it.get("data", it) if isinstance(it, dict) else {}) for it in js.get("data", [])]
+                rows += batch
+                offset += len(batch)
+                total = (js.get("meta") or {}).get("total", len(rows))
+                if not batch or offset >= total:
+                    break
+            if rows:
+                return parse_fdic(rows), year
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+    raise RuntimeError(f"FDIC Summary of Deposits request failed ({last_err})")
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner="Pulling small-business and bank-branch data…")
+def load_banking(zips: tuple[str, ...]):
+    """Returns dict(cbp, branches, population, status, loaded_at). Any failed source is None."""
+    out = {"cbp": None, "branches": None, "population": None}
+    status = []
+    census_key = secret("CENSUS_API_KEY")
+
+    def attempt(name, feeds, fn, store, detail_fn):
+        if offline():
+            status.append({"Source": name, "Feeds": feeds, "State": "Unavailable", "Detail": "Offline mode"})
+            return
+        try:
+            value, year = fn()
+            out[store] = value
+            status.append({"Source": name, "Feeds": feeds, "State": "Live", "Detail": detail_fn(value, year)})
+        except Exception as exc:  # noqa: BLE001
+            status.append({"Source": name, "Feeds": feeds, "State": "Unavailable", "Detail": _scrub(exc)})
+
+    attempt("Census CBP", "Small businesses by ZIP and size", lambda: fetch_cbp(list(zips), census_key), "cbp",
+            lambda v, y: f"{y} data, {len(v)} ZIPs with employer businesses")
+    attempt("FDIC Summary of Deposits", "Bank branches and deposits",
+            lambda: fetch_fdic_sod("FL", secret("FDIC_API_KEY")), "branches",
+            lambda v, y: f"June 30, {y} survey, {len(v):,} Florida branches")
+    attempt("Census ACS (population)", "Residents per ZIP", lambda: fetch_acs(list(zips), census_key), "population",
+            lambda v, y: f"{y - 4}-{y} estimates")
+    return {**out, "status": pd.DataFrame(status),
+            "loaded_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}
+
+
+# ---------------------------------------------------------------- connection check
+def _http_detail(r) -> str:
+    body = re.sub(r"<[^>]+>", " ", r.text or "")
+    return _scrub(f"HTTP {r.status_code}: {' '.join(body.split())[:140]}")
+
+
+def run_diagnostics() -> pd.DataFrame:
+    """One tiny request per source, from THIS server. Never returns key values."""
+    rows = []
+
+    def probe(source, key_name, fn, fix):
+        if key_name and not secret(key_name):
+            rows.append({"Source": source, "Key": f"{key_name}: missing", "Result": "❌ Not tried",
+                         "Detail": "No key is set.", "Fix": fix})
+            return
+        try:
+            ok, detail = fn()
+        except Exception as exc:  # noqa: BLE001
+            ok, detail = False, _scrub(exc)[:250]
+        rows.append({"Source": source, "Key": f"{key_name}: set" if key_name else "No key needed",
+                     "Result": "✅ Working" if ok else "❌ Failed", "Detail": detail, "Fix": "" if ok else fix})
+
+    def census(path_year_template, extra):
+        def run():
+            for year in (2024, 2023, 2022):
+                url = f"https://api.census.gov/data/{year}/{path_year_template}" + extra + f"&key={secret('CENSUS_API_KEY')}"
+                r = requests.get(url, headers=_headers(), timeout=20)
+                if r.status_code == 200:
+                    j = r.json()
+                    if isinstance(j, list) and len(j) >= 2:
+                        return True, f"{year} data returned"
+            return False, _http_detail(r)
+        return run
+
+    census_fix = "Check the key was activated (click the link in Census's email) and pasted without spaces or quotes inside quotes."
+    probe("Census ACS (income, education, population)", "CENSUS_API_KEY",
+          census("acs/acs5", "?get=NAME,B19013_001E&for=zip%20code%20tabulation%20area:33131"), census_fix)
+    probe("Census CBP (small businesses)", "CENSUS_API_KEY",
+          census("cbp", "?get=ESTAB,EMPSZES_LABEL&for=zip%20code:33131&NAICS2017=00&LFO=001"), census_fix)
+
+    def bea():
+        r = requests.get("https://apps.bea.gov/api/data", headers=_headers(), timeout=20, params={
+            "UserID": secret("BEA_API_KEY"), "method": "GetData", "datasetname": "Regional", "TableName": "CAGDP9",
+            "LineCode": "1", "GeoFips": "12086", "Year": "LAST5", "ResultFormat": "JSON"})
+        try:
+            res = r.json()["BEAAPI"]["Results"]
+            if "Data" in res:
+                return True, f"{len(res['Data'])} yearly values returned"
+            err = res.get("Error") or r.json()["BEAAPI"].get("Error") or {}
+            return False, _scrub(err.get("APIErrorDescription") or str(err))[:250]
+        except Exception:  # noqa: BLE001
+            return False, _http_detail(r)
+
+    probe("BEA GDP growth", "BEA_API_KEY", bea,
+          "Create a free key at apps.bea.gov/API/signup, click the activation link in the email, then paste it.")
+
+    def bls():
+        r = requests.get("https://data.bls.gov/cew/data/api/2024/a/area/12086.csv", headers=_headers(), timeout=30)
+        if r.status_code == 200 and "area_fips" in r.text[:300]:
+            return True, "Miami-Dade 2024 file returned"
+        return False, _http_detail(r)
+
+    probe("BLS QCEW (sector concentration)", None, bls,
+          "BLS may block automated requests that do not identify a contact. Set BLS_CONTACT_EMAIL to an email "
+          "you monitor, then retest.")
+
+    def fdic():
+        r = requests.get(FDIC_SOD_URL, headers=_headers(), timeout=30, params={
+            "filters": "YEAR:2025 AND STALPBR:FL AND ZIPBR:33131", "limit": 1,
+            **({"api_key": secret("FDIC_API_KEY")} if secret("FDIC_API_KEY") else {})})
+        if r.status_code == 200 and (r.json().get("data") or []):
+            return True, "Branch data returned"
+        return False, _http_detail(r)
+
+    probe("FDIC bank branches", None, fdic, "If it reports an authorization error, add a free api.data.gov key as FDIC_API_KEY.")
+
+    rows.append({"Source": "Anthropic (AI Analyst)", "Key": "ANTHROPIC_API_KEY: " + ("set" if secret("ANTHROPIC_API_KEY") else "missing"),
+                 "Result": "✅ Key present" if secret("ANTHROPIC_API_KEY") else "⚪ Optional",
+                 "Detail": "Not tested here to avoid usage charges.", "Fix": ""})
+    return pd.DataFrame(rows)

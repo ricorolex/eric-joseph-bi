@@ -4,3 +4,4 @@ numpy>=1.24
 requests>=2.31
 pydeck>=0.8
 altair>=5.0
+anthropic>=0.40

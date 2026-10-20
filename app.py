@@ -1,4 +1,5 @@
 import hmac
+import json
 from html import escape
 
 import altair as alt
@@ -7,7 +8,10 @@ import pandas as pd
 import pydeck as pdk
 import streamlit as st
 
-from data_sources import ALL_SECTORS, load_all, offline, secret
+import banking_ui
+from ai_assistant import (PURPOSES, DataTools, ai_enabled, brief_model, chat_model, generate_brief,
+                          get_client, run_chat)
+from data_sources import ALL_SECTORS, load_all, offline, run_diagnostics, secret
 
 st.set_page_config(page_title="Eric Joseph BI", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
 
@@ -104,8 +108,10 @@ if total_w == 0:
 
 if not all_live:
     samples = ", ".join(status.loc[status["State"] != "Live", "Source"])
-    st.warning(f"Sample data in use for: {samples}. Rankings are illustrative until those sources are live "
-               "(see the Data Sources tab).")
+    missing = [k for k in ("CENSUS_API_KEY", "BEA_API_KEY") if not secret(k)]
+    tip = (f" Missing keys: {', '.join(missing)} (both are free). Add them in Secrets, then click Refresh live data."
+           if missing else " Open the Data Sources tab and run the connection check to see exactly what failed.")
+    st.warning(f"Sample data in use for: {samples}. Rankings are illustrative until those sources are live." + tip)
 
 
 # ------------------------------------------------------------------ scoring
@@ -154,8 +160,17 @@ k3.markdown(kpi("Avg median income", f'${view["median_income"].mean():,.0f}', "a
 k4.markdown(kpi("Avg GDP growth", f'{view["gdp_growth_pct"].mean():.1f}%', "county-level"), unsafe_allow_html=True)
 st.write("")
 
-tab_over, tab_matrix, tab_compare, tab_brief, tab_src = st.tabs(
-    ["📍 Overview", "🧮 Market Matrix", "⚖️ Compare", "📖 Brief", "🔌 Data Sources"]
+tab_over, tab_matrix, tab_compare, tab_bank, tab_ai, tab_brief, tab_src = st.tabs(
+    ["📍 Overview", "🧮 Market Matrix", "⚖️ Compare", "🏦 Banking", "🤖 AI Analyst", "📖 Brief", "🔌 Data Sources"]
+)
+
+# Read-only data tools the AI can query. Race/ethnicity columns are never passed to it.
+filters_state = {"min_median_income": income_floor, "min_bachelors_only_pct": bachelor_floor}
+weights_pct = {"sector_concentration": round(w_lq / total_w * 100), "gdp_growth": round(w_gdp / total_w * 100),
+               "median_income": round(w_inc / total_w * 100), "education": round(w_edu / total_w * 100)}
+ai_tools = DataTools(
+    scored=df, sector_lq=sector_lq, sector=selected_sector, passing_cities=list(view["city"]),
+    filters=filters_state, weights_pct=weights_pct, sources=status[["Source", "State"]].to_dict("records"),
 )
 
 # ------------------------------------------------------------------ OVERVIEW
@@ -305,6 +320,101 @@ with tab_compare:
             width="stretch",
         )
 
+# ------------------------------------------------------------------ BANKING
+with tab_bank:
+    banking_ui.render()
+
+# ------------------------------------------------------------------ AI ANALYST
+with tab_ai:
+    st.markdown('<div class="section-title">AI Analyst</div>'
+                '<div class="section-sub">Claude explains and queries your dashboard data. Every figure it states comes '
+                'from the app\'s own numbers, and race/ethnicity columns are never shared with it.</div>',
+                unsafe_allow_html=True)
+    if not ai_enabled():
+        st.info("The AI Analyst is switched off. Add `ANTHROPIC_API_KEY` to your secrets to enable it "
+                "(create a key in the Claude Console). See DEPLOY.md for where secrets go.")
+    else:
+        client = get_client()
+        sub_brief, sub_chat = st.tabs(["📝 Brief generator", "💬 Ask the data"])
+
+        # ---- Brief generator
+        with sub_brief:
+            c1, c2 = st.columns([2, 1])
+            purpose = c1.selectbox("Brief for", PURPOSES)
+            top_n = c2.slider("Markets to cover", 3, 8, 5)
+            signature = json.dumps([purpose, top_n, selected_sector, filters_state, weights_pct, loaded_at])
+            if st.button("✨ Generate brief", type="primary"):
+                with st.spinner("Writing your brief…"):
+                    try:
+                        text = generate_brief(client, brief_model(), ai_tools, purpose, top_n)
+                        st.session_state["brief"] = {"text": text, "sig": signature,
+                                                     "label": f"{purpose} · {selected_sector} · data as of {loaded_at}"}
+                    except Exception as exc:  # noqa: BLE001
+                        st.error(f"The AI request failed ({type(exc).__name__}). Check ANTHROPIC_API_KEY and try again.")
+            saved = st.session_state.get("brief")
+            if saved:
+                if saved["sig"] != signature:
+                    st.caption("⚠️ Settings or data changed since this brief was generated. Regenerate to refresh it.")
+                with st.container(border=True):
+                    st.markdown(saved["text"])
+                st.caption(f"AI-generated from dashboard figures: {saved['label']}. Verify before acting on it.")
+                st.download_button("⬇️ Download brief (Markdown)", saved["text"].encode(),
+                                   file_name="eric_joseph_bi_brief.md", mime="text/markdown")
+
+        # ---- Ask the data
+        with sub_chat:
+            MAX_TURNS = 25
+            chat = st.session_state.setdefault("ai_chat", [])
+            st.caption("Answers use the sector, filters and weights currently set in the sidebar.")
+            examples = [
+                "Which markets have bachelor's+ above 40% and income over $70k?",
+                "Rank the top 5 markets for healthcare concentration.",
+                f"Why is {top['city']} ranked first?",
+                "Compare Tampa and Orlando.",
+            ]
+            ex_cols = st.columns(len(examples))
+            for i, q in enumerate(examples):
+                if ex_cols[i].button(q, key=f"ex{i}", width="stretch"):
+                    st.session_state["pending_q"] = q
+
+            for m in chat:
+                with st.chat_message(m["role"]):
+                    st.markdown(m["content"])
+                    if m.get("tools"):
+                        with st.expander("How this was answered"):
+                            for t in m["tools"]:
+                                st.code(f'{t["name"]}({json.dumps(t["input"])})', language="python")
+
+            prompt = st.chat_input("Ask about markets, sectors, income, education…", max_chars=500)
+            prompt = prompt or st.session_state.pop("pending_q", None)
+            if prompt:
+                if sum(1 for m in chat if m["role"] == "user") >= MAX_TURNS:
+                    st.warning("Chat limit reached for this session. Clear the chat to keep going.")
+                else:
+                    chat.append({"role": "user", "content": prompt})
+                    with st.chat_message("user"):
+                        st.markdown(prompt)
+                    with st.chat_message("assistant"):
+                        with st.spinner("Analyzing…"):
+                            try:
+                                out = run_chat(client, chat_model(), ai_tools,
+                                               [{"role": m["role"], "content": m["content"]} for m in chat])
+                            except Exception as exc:  # noqa: BLE001
+                                out = None
+                                chat.pop()  # drop the unanswered question so the history stays valid
+                                st.error(f"The AI request failed ({type(exc).__name__}). "
+                                         "Check ANTHROPIC_API_KEY and try again.")
+                        if out:
+                            st.markdown(out["text"])
+                            chat.append({"role": "assistant", "content": out["text"], "tools": out["tools"]})
+                            if out["tools"]:
+                                with st.expander("How this was answered"):
+                                    for t in out["tools"]:
+                                        st.code(f'{t["name"]}({json.dumps(t["input"])})', language="python")
+            if chat and st.button("🗑️ Clear chat"):
+                st.session_state["ai_chat"] = []
+                st.rerun()
+
 # ------------------------------------------------------------------ BRIEF
 with tab_brief:
     st.markdown('<div class="section-title">How to use this platform</div>', unsafe_allow_html=True)
@@ -328,7 +438,9 @@ with tab_brief:
             "2. Set income and education minimums in the sidebar.\n"
             "3. Adjust scoring weights to fit your priorities; they are normalized to sum to 100%.\n"
             "4. Use **Overview** for the map and ranking, **Market Matrix** to search and download, "
-            "and **Compare** for side-by-side views."
+            "and **Compare** for side-by-side views.\n"
+            "5. Use **AI Analyst** to generate a written brief or ask questions in plain English "
+            "(requires an Anthropic API key)."
         )
     st.markdown("#### 🧮 Score methodology")
     st.write("Opportunity score = weighted average of four min-max normalized components (0-1) scaled to 0-100: sector "
@@ -347,12 +459,28 @@ with tab_src:
         st.info("Offline mode is on (EJBI_OFFLINE). Live fetching is disabled.")
     st.markdown(
         "**Make everything live**\n"
-        "- **Census ACS:** works without a key at low volume; a free key from api.census.gov/data/key_signup.html "
-        "raises limits. Set `CENSUS_API_KEY`.\n"
-        "- **BLS QCEW:** open data, no key required.\n"
+        "- **Census (ACS and Business Patterns):** a free key is REQUIRED; Census rejects requests without one. "
+        "Get it at api.census.gov/data/key_signup.html and set `CENSUS_API_KEY`.\n"
+        "- **BLS QCEW:** open data, no key. If it fails from your host, set `BLS_CONTACT_EMAIL` (BLS asks "
+        "automated clients to identify a contact).\n"
         "- **BEA GDP:** needs a free key from apps.bea.gov/API/signup. Set `BEA_API_KEY`.\n\n"
+        "- **Banking tab:** small-business counts come from Census CBP and need `CENSUS_API_KEY`; bank branches come "
+        "from the FDIC Summary of Deposits. If FDIC asks for a key, a free api.data.gov key goes in `FDIC_API_KEY`.\n"
+        "- **AI Analyst:** set `ANTHROPIC_API_KEY` (Claude Console). Optional: `AI_CHAT_MODEL` and `AI_BRIEF_MODEL` "
+        "to change the models.\n\n"
         "Set keys in `.streamlit/secrets.toml` locally or in your host's secrets settings."
     )
+    st.caption(f"AI Analyst: {'enabled' if ai_enabled() else 'disabled (no ANTHROPIC_API_KEY)'}")
+
+    st.markdown("---")
+    st.markdown('<div class="section-title">🩺 Connection check</div>'
+                '<div class="section-sub">Tests every source once from this server and says exactly what is wrong. '
+                'Key values are never shown.</div>', unsafe_allow_html=True)
+    if st.button("Run connection check"):
+        with st.spinner("Testing each source…"):
+            st.session_state["diag"] = run_diagnostics()
+    if "diag" in st.session_state:
+        st.dataframe(st.session_state["diag"], hide_index=True, width="stretch")
 
 st.markdown('<div class="site-footer">© Eric Joseph BI · Data: U.S. Census Bureau (ACS), Bureau of Labor Statistics '
             '(QCEW), Bureau of Economic Analysis. For informational purposes only; not legal or investment advice.</div>',
