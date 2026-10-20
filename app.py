@@ -1,5 +1,6 @@
 import hmac
 import json
+import os
 from datetime import datetime
 from html import escape
 
@@ -160,7 +161,11 @@ if total_w == 0:
 if not all_live:
     samples = ", ".join(status.loc[status["State"] != "Live", "Source"])
     missing = [k for k in ("CENSUS_API_KEY", "BEA_API_KEY") if not secret(k)]
-    tip = (f" Missing keys: {', '.join(missing)} (both are free). Add them in Secrets, then click Refresh live data."
+    seen_names = sorted(k for k in os.environ if "CENSUS" in k.upper() or "BEA" in k.upper())
+    seen_txt = ("; this server sees these setting names: " + ", ".join(repr(k) for k in seen_names)) if seen_names \
+        else "; this server sees no setting whose name contains CENSUS or BEA"
+    tip = (f" Missing keys: {', '.join(missing)} (both are free). Add them in your host's secrets or environment "
+           f"settings, then redeploy and click Refresh live data{seen_txt}."
            if missing else " Open the Data Sources tab and run the connection check to see exactly what failed.")
     st.warning(f"Sample data in use for: {samples}. Rankings are illustrative until those sources are live." + tip)
 
