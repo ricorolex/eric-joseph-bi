@@ -12,6 +12,7 @@ import streamlit as st
 import banking_ui
 import batch_ui
 import memo as memo_mod
+from interpret import band, band_legend_html, driver_sentence, guide_market, rating
 from ai_assistant import (PURPOSES, DataTools, ai_enabled, brief_model, chat_model, generate_brief,
                           get_client, run_chat)
 from data_sources import ALL_SECTORS, load_all, offline, run_diagnostics, secret
@@ -47,6 +48,8 @@ html, body, [class*="css"], .stApp { font-family: 'Inter', system-ui, sans-serif
 .stTabs [aria-selected="true"] { background:#0b1f3a; color:#fff !important; }
 .stTabs [aria-selected="true"] p, .stTabs [data-baseweb="tab"] p { color:inherit !important; }
 .kpi-row-gap { height: .5rem; }
+.read-line { margin:10px 0 6px 0; padding:10px 14px; border-left:4px solid #0e7490; background:rgba(14,116,144,.08);
+  border-radius:0 10px 10px 0; font-size:.9rem; }
 .site-footer { text-align:center; color:#94a3b8; font-size:.8rem; margin-top:36px; }
 </style>
 """,
@@ -96,6 +99,9 @@ hero(pill_html)
 # One-click role presets. Each sets every slider so the result is predictable. Banking sliders live in the Banking tab.
 PRESETS = {
     "Custom (my own settings)": None,
+    "↩ Reset to defaults": {"w_lq": 30, "w_gdp": 20, "w_inc": 30, "w_edu": 20, "income_floor": 40000,
+                           "bachelor_floor": 15, "bk_w1": 40, "bk_w2": 40, "bk_w3": 20,
+                           "note": "Back to the standard weights and filters."},
     "🏦 Banking expansion": {
         "w_lq": 0, "w_gdp": 40, "w_inc": 30, "w_edu": 30, "income_floor": 40000, "bachelor_floor": 15,
         "bk_w1": 20, "bk_w2": 50, "bk_w3": 30,
@@ -105,9 +111,10 @@ PRESETS = {
         "w_lq": 20, "w_gdp": 30, "w_inc": 0, "w_edu": 50, "income_floor": 30000, "bachelor_floor": 25,
         "note": "50% bachelor's+ attainment, 30% GDP growth, 20% sector concentration. Minimum bachelor's 25%."},
     "💎 Wealth management": {
-        "w_lq": 0, "w_gdp": 40, "w_inc": 60, "w_edu": 0, "income_floor": 140000, "bachelor_floor": 0,
-        "note": "60% median income (minimum $140k), 40% growth. Population growth is not in the data, so GDP growth "
-                "stands in for it."},
+        "w_lq": 0, "w_gdp": 40, "w_inc": 60, "w_edu": 0, "income_floor": 90000, "bachelor_floor": 0,
+        "note": "60% median income, 40% growth, markets with median income of $90k or more. Raise the income minimum "
+                "to $140k to see only the very highest-income markets (that leaves very few). Population growth is not "
+                "in the data, so GDP growth stands in for it."},
 }
 
 
@@ -117,6 +124,11 @@ def _apply_preset() -> None:
         for k, v in cfg.items():
             if k != "note":
                 st.session_state[k] = v
+
+
+def _reset_all() -> None:
+    st.session_state["preset"] = "↩ Reset to defaults"
+    _apply_preset()
 
 
 st.sidebar.markdown("### 🎛️ Filters")
@@ -180,7 +192,9 @@ view = (
 view.insert(0, "rank", view.index + 1)
 
 if view.empty:
-    st.warning("⚠️ No markets match your filters. Lower the income or education minimums in the sidebar.")
+    st.warning("⚠️ No markets match your filters, so there is nothing to show. Lower the income or education minimum "
+               "in the sidebar, or reset everything with the button below.")
+    st.button("↩ Reset filters and weights", type="primary", on_click=_reset_all)
     st.stop()
 
 
@@ -191,7 +205,7 @@ def kpi(label: str, value: str, sub: str = "") -> str:
 
 top = view.iloc[0]
 k1, k2, k3, k4 = st.columns(4)
-k1.markdown(kpi("Top market", top["city"], f'Score {top["BI_Score"]:.0f} / 100'), unsafe_allow_html=True)
+k1.markdown(kpi("Top market", top["city"], f'Score {top["BI_Score"]:.0f} / 100 · {rating(top["BI_Score"])}'), unsafe_allow_html=True)
 k2.markdown(kpi("Markets matching", f"{len(view)} of {len(df)}", selected_sector.split(" (")[0]), unsafe_allow_html=True)
 k3.markdown(kpi("Avg median income", f'${view["median_income"].mean():,.0f}', "across matching markets"), unsafe_allow_html=True)
 k4.markdown(kpi("Avg GDP growth", f'{view["gdp_growth_pct"].mean():.1f}%', "county-level"), unsafe_allow_html=True)
@@ -213,6 +227,7 @@ ai_tools = DataTools(
 
 # ------------------------------------------------------------------ OVERVIEW
 with tab_over:
+    guide_market(st)
     c_map, c_rank = st.columns([6, 5], gap="large")
 
     with c_map:
@@ -252,6 +267,7 @@ with tab_over:
             ).properties(height=max(260, 30 * len(view)))
         )
         st.altair_chart(chart, width="stretch")
+        st.markdown(band_legend_html(), unsafe_allow_html=True)
 
     st.markdown("---")
     st.markdown('<div class="section-title">🔎 Market spotlight</div>'
@@ -260,10 +276,13 @@ with tab_over:
     row = view[view["city"] == pick].iloc[0]
     s1, s2, s3, s4, s5 = st.columns(5)
     s1.metric("Rank", f'#{int(row["rank"])} of {len(view)}')
-    s2.metric("Score", f'{row["BI_Score"]:.0f}')
+    s2.metric("Score", f'{row["BI_Score"]:.0f} · {rating(row["BI_Score"])}')
     s3.metric("Median income", f'${row["median_income"]:,.0f}')
     s4.metric("GDP growth", "n/a" if pd.isna(row["gdp_growth_pct"]) else f'{row["gdp_growth_pct"]:.1f}%')
     s5.metric("Bachelor's+", f'{row["highly_educated_pct"]:.0f}%')
+    _lab, _col, _mean = band(row["BI_Score"])
+    st.markdown(f'<div class="read-line" style="border-left-color:{_col}"><b>{escape(_lab)} ({row["BI_Score"]:.0f}/100):</b> {escape(_mean)} '
+                f'{escape(driver_sentence(row, parts, total_w))}</div>', unsafe_allow_html=True)
     contrib = pd.DataFrame({"Component": list(parts), "Points": [row[f"c_{n}"] for n in parts]})
     bars = (alt.Chart(contrib).mark_bar(cornerRadiusEnd=5, color=TEAL, height=22)
             .encode(x=alt.X("Points:Q", title="Points contributed to score"),
@@ -292,13 +311,14 @@ with tab_matrix:
                 "City (A–Z)": ("city", True)}
     col, asc = sort_map[sort_by]
     mx = mx.sort_values(col, ascending=asc)
+    mx["rating"] = mx["BI_Score"].map(rating)
 
     VIEWS = {
-        "Summary": ["rank", "city", "county", "BI_Score", "median_income", "gdp_growth_pct", "highly_educated_pct", "lq"],
+        "Summary": ["rank", "city", "county", "BI_Score", "rating", "median_income", "gdp_growth_pct", "highly_educated_pct", "lq"],
         "Economy": ["city", "county", "median_income", "gdp_growth_pct", "lq", "BI_Score"],
         "Education": ["city", "edu_associate_pct", "edu_bachelor_pct", "edu_graduate_pct", "highly_educated_pct"],
         "Demographics": ["city", "county", "race_white_pct", "race_black_pct", "race_asian_pct", "race_hispanic_latino_pct"],
-        "Everything": ["rank", "city", "county", "zip_code", "BI_Score", "lq", "median_income", "gdp_growth_pct",
+        "Everything": ["rank", "city", "county", "zip_code", "BI_Score", "rating", "lq", "median_income", "gdp_growth_pct",
                        "edu_associate_pct", "edu_bachelor_pct", "edu_graduate_pct", "highly_educated_pct",
                        "race_white_pct", "race_black_pct", "race_asian_pct", "race_hispanic_latino_pct"],
     }
@@ -310,6 +330,7 @@ with tab_matrix:
         "county": cc.TextColumn("County"),
         "zip_code": cc.TextColumn("ZIP"),
         "BI_Score": cc.ProgressColumn("Opportunity score", min_value=0, max_value=100, format="%.0f"),
+        "rating": cc.TextColumn("Rating", help="80+ Exceptional, 65+ Strong, 50+ Solid, 35+ Moderate, below Weak"),
         "lq": cc.NumberColumn("Sector LQ", format="%.2f", help="Location quotient: >1 means more concentrated than the U.S."),
         "median_income": cc.NumberColumn("Median income", format="$%d"),
         "gdp_growth_pct": cc.NumberColumn("GDP growth", format="%.1f%%"),
@@ -486,7 +507,11 @@ with tab_memo:
     m1, m2 = st.columns([3, 2])
     prepared_for = m1.text_input("Prepared for (optional)", placeholder="e.g. Investment Committee, Q4 expansion review",
                                  key="memo_for")
-    n_mk = m2.slider("Markets to include", 3, max(3, min(12, len(view))), min(8, max(3, len(view))), key="memo_n")
+    if len(view) > 3:  # a slider needs min < max; with 3 or fewer markets, include them all
+        n_mk = m2.slider("Markets to include", 3, min(12, len(view)), min(8, len(view)), key="memo_n")
+    else:
+        n_mk = len(view)
+        m2.caption(f"Including all {n_mk} market(s) that match your filters.")
     if saved_brief:
         st.success(f"Executive summary will use your AI brief: {saved_brief['label']}")
     elif ai_enabled():

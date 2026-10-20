@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 
 from banking import branch_outliers, bank_share, catchment_branches
+from interpret import SCORE_NOTE, rating
 
 NAVY, TEAL = "0B1F3A", "0E7490"
 DISCLAIMER = (
@@ -43,6 +44,7 @@ def collect(view: pd.DataFrame, sector_lq: pd.DataFrame, selected_sector: str, w
         "Rank": v["rank"].astype(int).astype(str),
         "Market": v["city"], "ZIP": v["zip_code"],
         "Score": v["BI_Score"].map(lambda x: f"{x:.0f}"),
+        "Rating": v["BI_Score"].map(rating),
         "Sector LQ": v["lq"].map(lambda x: _fmt_num(x, 2)),
         "Median income": v["median_income"].map(_fmt_money),
         "GDP growth": v["gdp_growth_pct"].map(lambda x: _fmt_num(x, 1, "%")),
@@ -70,6 +72,7 @@ def collect(view: pd.DataFrame, sector_lq: pd.DataFrame, selected_sector: str, w
         m["banking"] = pd.DataFrame({
             "ZIP": t["zip_code"], "Market": t["city"], "Small biz": t["small_biz"].map(lambda x: _fmt_num(x)),
             "Branches": t["branches_in_zip"].map(lambda x: _fmt_num(x)),
+            "Opportunity": t["opportunity"].map(lambda x: f"{x:.0f} {rating(x)}"),
             "Biz / branch": t["small_biz_per_branch"].map(lambda x: _fmt_num(x)),
             "Coverage": t["coverage"], "Capture idx": t["capture_index"].map(lambda x: _fmt_num(x)),
             "Concentration": t["hhi_label"],
@@ -249,6 +252,7 @@ def build_docx(m: dict) -> bytes:
         heading("2. Macro scorecard")
         doc.add_paragraph("Markets ranked by the Synoptic BI score, a relative 0-100 measure within this set of markets.")
         df_table(m["scorecard"])
+        pn = doc.add_paragraph(); runs(pn, SCORE_NOTE, 8.5)
         for s_ in m["settings"]:
             p = doc.add_paragraph(style="List Bullet"); runs(p, s_, 9.5)
         heading(m["sector_title"], 2)
@@ -353,7 +357,7 @@ def build_pdf(m: dict) -> bytes:
 
     story += [P("2. Macro scorecard", h1),
               P("Markets ranked by the Synoptic BI score, a relative 0-100 measure within this set of markets."),
-              df_t(m["scorecard"]), Spacer(1, 4), bullets(m["settings"], small),
+              df_t(m["scorecard"]), Spacer(1, 3), P(SCORE_NOTE, small), bullets(m["settings"], small),
               P(m["sector_title"], h2), df_t(m["sector_table"])]
     if m["banking"] is not None:
         story += [P("3. Micro spatial analysis: small businesses vs bank branches", h1), df_t(m["banking"]),

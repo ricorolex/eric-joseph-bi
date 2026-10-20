@@ -12,6 +12,7 @@ import streamlit as st
 
 from banking import (CAPTURE_LABELS, DEFAULT_WEIGHTS, HHI_LABELS, SMALL_DEFS, bank_share, branch_outliers,
                      build_banking_table, catchment_branches)
+from interpret import band, guide_banking, rating
 from data_sources import MARKET_COLS, MARKETS, load_banking
 from routing import DRIVE_MINUTES, load_catchments, ors_key
 
@@ -30,6 +31,60 @@ METROS = {
     "Southwest Florida": ["34103", "34108", "34109", "33904", "33908", "34231", "34202"],
 }
 MAX_EXTRA_ZIPS = 25
+
+
+SPOT_CSS = """
+<style>
+.sp-banner { display:flex; justify-content:space-between; align-items:center; gap:16px; flex-wrap:wrap;
+  background:linear-gradient(120deg,#0b1f3a 0%,#0e4d64 60%,#0e7490 100%); color:#fff; border-radius:16px;
+  padding:18px 22px; margin:6px 0 14px 0; box-shadow:0 6px 20px rgba(11,31,58,.15); }
+.sp-eyebrow { letter-spacing:.16em; font-size:.68rem; font-weight:600; color:#7dd3e0; }
+.sp-title { font-size:1.55rem; font-weight:800; line-height:1.15; overflow-wrap:anywhere; }
+.sp-sub { font-size:.86rem; color:#cfe8ee; margin-top:2px; }
+.sp-pills { display:flex; gap:8px; flex-wrap:wrap; }
+.sp-pill { display:inline-flex; flex-direction:column; border-radius:12px; padding:6px 12px; min-width:104px; }
+.sp-pill small { font-size:.62rem; letter-spacing:.08em; text-transform:uppercase; opacity:.75; font-weight:600; }
+.sp-pill b { font-size:.82rem; font-weight:700; line-height:1.2; }
+.sp-group { font-size:.7rem; letter-spacing:.14em; text-transform:uppercase; font-weight:700; color:#0e7490; margin:10px 0 6px 2px; }
+.sp-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; }
+.sp-card { background:#fff; border:1px solid #e5eaf1; border-radius:12px; padding:10px 14px; min-width:0; }
+.sp-label { font-size:.68rem; text-transform:uppercase; letter-spacing:.07em; color:#64748b; font-weight:600; }
+.sp-value { font-size:1.2rem; font-weight:800; color:#0b1f3a; line-height:1.25; margin-top:1px; overflow-wrap:anywhere; }
+.sp-long { font-size:.95rem; line-height:1.3; }
+.sp-note { font-size:.72rem; color:#0e7490; margin-top:1px; overflow-wrap:anywhere; }
+.sp-read { margin:12px 0 10px 0; padding:10px 14px; border-left:4px solid #0e7490; background:rgba(14,116,144,.08);
+  border-radius:0 10px 10px 0; font-size:.9rem; }
+</style>
+"""
+COVER_STYLE = {"Underserved": ("#dff3f6", "#0b5f73"), "Balanced": ("#e8eef5", "#0b1f3a"),
+               "Saturated": ("#fef3c7", "#92400e"), "No branch in ZIP": ("#fee2e2", "#991b1b")}
+CAPTURE_STYLE = {"Under-captured": ("#dff3f6", "#0b5f73"), "Typical": ("#e8eef5", "#0b1f3a"),
+                 "Deposit-rich": ("#e0e7ff", "#312e81")}
+HHI_STYLE = {"Highly concentrated": ("#fef3c7", "#92400e"), "Moderately concentrated": ("#e8eef5", "#0b1f3a"),
+             "Fragmented": ("#dff3f6", "#0b5f73")}
+
+
+def _pill(label: str, value: str, styles: dict) -> str:
+    bg, fg = styles.get(value, ("#e8eef5", "#0b1f3a"))
+    return f'<div class="sp-pill" style="background:{bg};color:{fg}"><small>{escape(label)}</small><b>{escape(str(value))}</b></div>'
+
+
+def _pill_color(label: str, value: str, color: str) -> str:
+    return (f'<div class="sp-pill" style="background:{color};color:#fff"><small style="opacity:.85">{escape(label)}</small>'
+            f'<b>{escape(value)}</b></div>')
+
+
+def _cards(items: list[tuple[str, str, str]]) -> str:
+    inner = "".join(f'<div class="sp-card"><div class="sp-label">{escape(l)}</div>'
+                    f'<div class="sp-value{" sp-long" if len(str(v)) > 16 else ""}">{escape(str(v))}</div>'
+                    f'<div class="sp-note">{escape(n)}</div></div>' for l, v, n in items)
+    return f'<div class="sp-grid">{inner}</div>'
+
+
+def _money(v) -> str:
+    if v is None or pd.isna(v):
+        return "n/a"
+    return f"${v / 1e9:,.1f}B" if v >= 1e9 else f"${v / 1e6:,.0f}M" if v >= 1e6 else f"${v / 1e3:,.0f}K"
 
 
 def _kpi(label: str, value: str, sub: str = "") -> str:
@@ -158,7 +213,7 @@ def render() -> None:
     med = table.loc[table["branches_in_zip"] > 0, "small_biz_per_branch"].median()
     k3.markdown(_kpi("Median per branch", "n/a" if pd.isna(med) else f"{med:,.0f}", "small businesses per branch"),
                 unsafe_allow_html=True)
-    k4.markdown(_kpi("Top opportunity", top["city"], f'ZIP {top["zip_code"]} · {top["coverage"]}'),
+    k4.markdown(_kpi("Top opportunity", top["city"], f'ZIP {top["zip_code"]} · {rating(top["opportunity"])} ({top["opportunity"]:.0f})'),
                 unsafe_allow_html=True)
     st.write("")
 
@@ -199,6 +254,8 @@ def render() -> None:
                  .properties(height=max(260, 28 * len(table))))
         st.altair_chart(chart, width="stretch")
 
+    guide_banking(st)
+
     # ---- Matrix
     st.markdown("---")
     st.markdown('<div class="section-title">ZIP matrix</div>'
@@ -209,13 +266,14 @@ def render() -> None:
     view_name = f2.radio("View", ["Opportunity", "Small business", "Banks & deposits", "Competitor vulnerability"],
                          horizontal=True, key="bk_view")
     mx = table.copy()
+    mx["rating"] = mx["opportunity"].map(rating)
     if q:
         mx = mx[mx["label"].str.lower().str.contains(q.lower())]
     mx["deposits_in_zip_m"] = mx["deposits_in_zip"] / 1e6
     mx["deposits_nearby_m"] = mx["deposits_nearby"] / 1e6
     mx["deposits_per_small_biz_k"] = mx["deposits_per_small_biz"] / 1e3
     VIEWS = {
-        "Opportunity": ["rank", "city", "zip_code", "opportunity", "coverage", "small_biz", "branches_in_zip",
+        "Opportunity": ["rank", "city", "zip_code", "opportunity", "rating", "coverage", "small_biz", "branches_in_zip",
                         "small_biz_per_branch", "branches_nearby"],
         "Small business": ["city", "zip_code", "small_biz", "estab_lt5", "estab_5_19", "estab_20plus", "estab_total",
                            "employees", "small_biz_per_10k_pop", "population"],
@@ -230,6 +288,7 @@ def render() -> None:
     config = {
         "rank": cc.NumberColumn("#", width="small"), "city": cc.TextColumn("Market"), "zip_code": cc.TextColumn("ZIP"),
         "opportunity": cc.ProgressColumn("Opportunity", min_value=0, max_value=100, format="%.0f"),
+        "rating": cc.TextColumn("Rating", help="80+ Exceptional, 65+ Strong, 50+ Solid, 35+ Moderate, below Weak"),
         "coverage": cc.TextColumn("Coverage", help="Compared with the median small-businesses-per-branch of these ZIPs"),
         "small_biz": cc.NumberColumn("Small businesses", format="%d"),
         "estab_lt5": cc.NumberColumn("Under 5 emp.", format="%d"),
@@ -267,15 +326,12 @@ def render() -> None:
 
     # ---- Spotlight
     st.markdown("---")
-    st.markdown('<div class="section-title">🔎 ZIP spotlight: who is competing here?</div>', unsafe_allow_html=True)
+    st.markdown(SPOT_CSS, unsafe_allow_html=True)
+    st.markdown('<div class="section-title">🔎 ZIP spotlight: who is competing here?</div>'
+                '<div class="section-sub">Pick a ZIP to see demand, competition and the branches around it.</div>',
+                unsafe_allow_html=True)
     pick = st.selectbox("ZIP", table["label"], label_visibility="collapsed", key="bk_pick")
     row = table[table["label"] == pick].iloc[0]
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Small businesses", f'{row["small_biz"]:,.0f}')
-    m2.metric("Branches in ZIP", f'{row["branches_in_zip"]:,.0f}')
-    m3.metric("Businesses per branch", f'{row["small_biz_per_branch"]:,.0f}')
-    m4.metric("Deposits in ZIP", f'${row["deposits_in_zip"] / 1e6:,.1f}M')
-    m5.metric("Coverage", row["coverage"])
 
     ring = catchments.get(row["zip_code"]) if use_drive else None
     nb = catchment_branches(branches, row["latitude"], row["longitude"], radius, ring)
@@ -283,58 +339,115 @@ def render() -> None:
     if nb.empty:  # no coordinates available: fall back to branches inside the ZIP itself
         nb = branches[branches["zip5"] == row["zip_code"]].assign(distance_mi=np.nan).sort_values(
             "deposits_usd", ascending=False)
-    v1, v2, v3, v4 = st.columns(4)
-    v1.metric("Deposit capture index", "n/a" if pd.isna(row["capture_index"]) else f'{row["capture_index"]:,.0f}',
-              row["capture_label"], delta_color="off")
-    v2.metric("Deposit HHI (area)", "n/a" if pd.isna(row["hhi_used"]) else f'{row["hhi_used"]:,.0f}',
-              row["hhi_label"], delta_color="off")
-    v3.metric("Largest bank in ZIP", str(row["top_bank"] or "none")[:28],
-              "" if pd.isna(row["top_bank_share_pct"]) else f'{row["top_bank_share_pct"]:.0f}% of deposits', delta_color="off")
-    v4.metric("Weak branches in area", "n/a" if pd.isna(row["underperforming_branches"]) else f'{row["underperforming_branches"]:.0f}')
-    st.markdown(f"**{len(nb)} branches within {scope}** (largest deposits first)")
-    if ring is not None and len(ring) > 2:
-        poly = pd.DataFrame({"polygon": [[list(p) for p in ring]]})
-        pts = nb.dropna(subset=["lat", "lon"]).assign(tip=lambda d: "<b>" + d["bank"] + "</b><br/>$"
-                                                       + (d["deposits_usd"] / 1e6).round(1).astype(str) + "M")
-        st.pydeck_chart(pdk.Deck(
-            layers=[pdk.Layer("PolygonLayer", data=poly, get_polygon="polygon", get_fill_color=[14, 116, 144, 45],
-                              get_line_color=[14, 116, 144, 220], line_width_min_pixels=2),
-                    pdk.Layer("ScatterplotLayer", data=pts[["lon", "lat", "tip"]], get_position="[lon, lat]",
-                              get_fill_color=[245, 158, 11, 230], get_radius=90, radius_min_pixels=4, pickable=True)],
-            initial_view_state=pdk.ViewState(latitude=float(row["latitude"]), longitude=float(row["longitude"]), zoom=10.5),
-            tooltip={"html": "{tip}", "style": {"backgroundColor": NAVY, "color": "white"}}), height=360)
+    out = branch_outliers(nb) if not nb.empty else nb
+    flagged = (out[out["flag"] != "In line"] if not nb.empty else nb)
+
+    def num(v, fmt="{:,.0f}"):
+        return "n/a" if pd.isna(v) else fmt.format(v)
+
+    opp_txt = f'{row["opportunity"]:.0f} · {rating(row["opportunity"])}'
+    opp_color = band(row["opportunity"])[1]
+    # Banner: who and where, with the status labels as pills.
+    st.markdown(
+        f'<div class="sp-banner"><div><div class="sp-eyebrow">ZIP {escape(str(row["zip_code"]))}</div>'
+        f'<div class="sp-title">{escape(str(row["city"]))}</div>'
+        f'<div class="sp-sub">{len(nb)} branches within {escape(scope)} · {num(row["small_biz"])} small businesses</div></div>'
+        f'<div class="sp-pills">{_pill_color("Opportunity", opp_txt, opp_color)}'
+        f'{_pill("Coverage", row["coverage"], COVER_STYLE)}'
+        f'{_pill("Capture", row["capture_label"], CAPTURE_STYLE)}'
+        f'{_pill("Deposits", row["hhi_label"], HHI_STYLE)}</div></div>', unsafe_allow_html=True)
+
+    top_name = (str(row["top_bank"]).replace(", National Association", " N.A.").replace(" National Association", " N.A.")
+                if pd.notna(row["top_bank"]) and row["top_bank"] else "None")
+    share_txt = "" if pd.isna(row["top_bank_share_pct"]) else f'{row["top_bank_share_pct"]:.0f}% of ZIP deposits'
+    demand = [("Small businesses", num(row["small_biz"]), "employer locations"),
+              ("Branches in ZIP", num(row["branches_in_zip"]), f'{num(row["banks_in_zip"])} different banks'),
+              ("Businesses per branch", num(row["small_biz_per_branch"]), "higher = fewer banks per business"),
+              ("Deposits in ZIP", _money(row["deposits_in_zip"]), "booked at branches in the ZIP")]
+    compete = [("Deposit capture index", num(row["capture_index"]), "100 = median ZIP"),
+               ("Deposit HHI", num(row["hhi_used"]), f"area concentration (0-10,000)"),
+               ("Largest bank", top_name, share_txt),
+               ("Weak branches", num(row["underperforming_branches"]), "under half the median branch")]
+    st.markdown(f'<div class="sp-group">Demand</div>{_cards(demand)}<div class="sp-group">Competition</div>{_cards(compete)}',
+                unsafe_allow_html=True)
+
+    # One plain-English reading so the numbers are not left to the reader.
+    bits = [f'{row["coverage"].lower()} coverage' if row["coverage"] not in ("n/a",) else "coverage not rated"]
+    if pd.notna(row["capture_index"]):
+        bits.append(f'deposits per small business are {row["capture_label"].lower()} (index {row["capture_index"]:.0f})')
+    if pd.notna(row["hhi_used"]):
+        bits.append(f'{row["hhi_label"].lower()} deposits')
+    if pd.notna(row["underperforming_branches"]) and row["underperforming_branches"] > 0:
+        bits.append(f'{row["underperforming_branches"]:.0f} weak branch(es) nearby')
+    st.markdown(f'<div class="sp-read"><b>In short:</b> {escape("; ".join(bits))}.</div>', unsafe_allow_html=True)
+
     if nb.empty:
         st.info("No FDIC-insured branches found in this area.")
     else:
-        show = nb.assign(deposits_m=nb["deposits_usd"] / 1e6)[["bank", "address", "city", "zip5", "distance_mi", "deposits_m"]]
-        st.dataframe(show, hide_index=True, width="stretch", height=min(80 + 36 * len(show), 420),
-                     column_config={"bank": cc.TextColumn("Bank"), "address": cc.TextColumn("Address"),
-                                    "city": cc.TextColumn("City"), "zip5": cc.TextColumn("ZIP"),
-                                    "distance_mi": cc.NumberColumn("Miles", format="%.1f"),
-                                    "deposits_m": cc.NumberColumn("Branch deposits", format="$%.1fM")})
-        out = branch_outliers(nb)
-        flagged = out[out["flag"] != "In line"].assign(deposits_m=lambda d: d["deposits_usd"] / 1e6,
-                                                      peer_m=lambda d: d["peer_median_usd"] / 1e6)
-        if not flagged.empty:
-            with st.expander(f"Branch outliers vs the median branch in this area ({len(flagged)})", expanded=False):
-                st.caption("Underperforming = under half the median branch's deposits (possible weak branch, "
-                           "acquisition or share-gain target). Overperforming = over twice the median; often a "
-                           "headquarters or online-booked branch, so verify before drawing conclusions.")
-                st.dataframe(flagged.sort_values("vs_peer")[["flag", "bank", "address", "city", "deposits_m", "peer_m", "vs_peer"]],
+        t_comp, t_share, t_out, t_map = st.tabs(["🏦 Branches", "📊 Deposit share", f"⚠️ Outliers ({len(flagged)})", "🗺️ Map"])
+        with t_comp:
+            area_total = float(nb["deposits_usd"].sum())
+            show = nb.assign(deposits_m=nb["deposits_usd"] / 1e6,
+                             where=nb["address"].astype(str).str.strip() + ", " + nb["zip5"].astype(str),
+                             share=(nb["deposits_usd"] / area_total * 100) if area_total > 0 else 0.0)
+            full = st.toggle(f"Show all {len(show)} branches", value=False, key="bk_all") if len(show) > 12 else True
+            show = show if full else show.head(12)
+            st.dataframe(show[["bank", "where", "distance_mi", "deposits_m", "share"]], hide_index=True, width="stretch",
+                         height=min(60 + 36 * len(show), 480),
+                         column_config={"bank": cc.TextColumn("Bank", width="medium"),
+                                        "where": cc.TextColumn("Location", width="large"),
+                                        "distance_mi": cc.NumberColumn("Miles", format="%.1f", width="small"),
+                                        "deposits_m": cc.NumberColumn("Deposits", format="$%.0fM", width="small"),
+                                        "share": cc.NumberColumn("Share", format="%.1f%%", width="small",
+                                                                 help="Share of deposits in the competitor area")})
+            if not full:
+                st.caption("Largest 12 shown, by deposits.")
+        with t_share:
+            share = bank_share(nb).head(8)
+            st.altair_chart(
+                alt.Chart(share).mark_bar(cornerRadiusEnd=5, color=TEAL, height=18).encode(
+                    x=alt.X("share_pct:Q", title=f"Share of deposits within {scope} (%)"),
+                    y=alt.Y("bank:N", sort="-x", title=None, axis=alt.Axis(labelLimit=240)),
+                    tooltip=["bank", alt.Tooltip("share_pct:Q", format=".1f"), alt.Tooltip("branches:Q")],
+                ).properties(height=max(160, 30 * len(share))), width="stretch")
+        with t_out:
+            if flagged.empty:
+                st.success("No branches stand out from the median branch in this area.")
+            else:
+                st.caption("Underperforming = under half the median branch's deposits (possible weak branch, acquisition "
+                           "or share-gain target). Overperforming = over twice the median, often a headquarters or "
+                           "online-booked branch, so verify before drawing conclusions.")
+                fl = flagged.assign(deposits_m=lambda d: d["deposits_usd"] / 1e6, peer_m=lambda d: d["peer_median_usd"] / 1e6)
+                st.dataframe(fl.sort_values("vs_peer")[["flag", "bank", "address", "deposits_m", "peer_m", "vs_peer"]],
                              hide_index=True, width="stretch",
-                             column_config={"flag": cc.TextColumn("Flag"), "bank": cc.TextColumn("Bank"),
-                                            "address": cc.TextColumn("Address"), "city": cc.TextColumn("City"),
-                                            "deposits_m": cc.NumberColumn("Branch deposits", format="$%.1fM"),
-                                            "peer_m": cc.NumberColumn("Median branch", format="$%.1fM"),
-                                            "vs_peer": cc.NumberColumn("× median", format="%.2f")})
-        share = bank_share(nb).head(8)
-        st.altair_chart(
-            alt.Chart(share).mark_bar(cornerRadiusEnd=5, color=TEAL, height=20).encode(
-                x=alt.X("share_pct:Q", title=f"Share of deposits within {scope} (%)"),
-                y=alt.Y("bank:N", sort="-x", title=None),
-                tooltip=["bank", alt.Tooltip("share_pct:Q", format=".1f"), alt.Tooltip("branches:Q")],
-            ).properties(height=max(160, 30 * len(share))),
-            width="stretch")
+                             column_config={"flag": cc.TextColumn("Flag", width="small"), "bank": cc.TextColumn("Bank", width="medium"),
+                                            "address": cc.TextColumn("Address", width="large"),
+                                            "deposits_m": cc.NumberColumn("Deposits", format="$%.0fM", width="small"),
+                                            "peer_m": cc.NumberColumn("Median branch", format="$%.0fM", width="small"),
+                                            "vs_peer": cc.NumberColumn("× median", format="%.2f", width="small")})
+        with t_map:
+            pts = nb.dropna(subset=["lat", "lon"]).assign(
+                tip=lambda d: "<b>" + d["bank"] + "</b><br/>" + d["address"].astype(str) + "<br/>$"
+                              + (d["deposits_usd"] / 1e6).round(1).astype(str) + "M")
+            layers = []
+            if ring is not None and len(ring) > 2:
+                layers.append(pdk.Layer("PolygonLayer", data=pd.DataFrame({"polygon": [[list(p) for p in ring]]}),
+                                        get_polygon="polygon", get_fill_color=[14, 116, 144, 45],
+                                        get_line_color=[14, 116, 144, 220], line_width_min_pixels=2))
+            layers.append(pdk.Layer("ScatterplotLayer", data=pts[["lon", "lat", "tip"]], get_position="[lon, lat]",
+                                    get_fill_color=[245, 158, 11, 230], get_radius=90, radius_min_pixels=4, pickable=True))
+            if pd.notna(row["latitude"]) and pd.notna(row["longitude"]):
+                layers.append(pdk.Layer("ScatterplotLayer",
+                                        data=pd.DataFrame({"lon": [row["longitude"]], "lat": [row["latitude"]],
+                                                           "tip": [f'ZIP {row["zip_code"]}']}),
+                                        get_position="[lon, lat]", get_fill_color=[11, 31, 58, 240], get_radius=140,
+                                        radius_min_pixels=7, pickable=True))
+            clat = float(row["latitude"]) if pd.notna(row["latitude"]) else float(pts["lat"].mean())
+            clon = float(row["longitude"]) if pd.notna(row["longitude"]) else float(pts["lon"].mean())
+            st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=pdk.ViewState(latitude=clat, longitude=clon, zoom=11),
+                                     tooltip={"html": "{tip}", "style": {"backgroundColor": NAVY, "color": "white"}}),
+                            height=380)
+            st.caption("Navy dot = the ZIP point, orange dots = bank branches" + (", teal area = drive-time catchment." if ring is not None else "."))
 
     st.caption("How to read this: counts are employer establishments (locations), not companies, and exclude sole "
                "proprietors with no employees. Branch deposits are as booked at each branch and can be distorted by "
