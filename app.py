@@ -1,6 +1,5 @@
 import hmac
 import json
-import os
 from datetime import datetime
 from html import escape
 
@@ -12,13 +11,29 @@ import streamlit as st
 
 import banking_ui
 import batch_ui
-import charts as charts_mod
-from banking import bank_share, catchment_branches
 import memo as memo_mod
-from interpret import band, band_legend_html, driver_sentence, guide_market, rating
 from ai_assistant import (PURPOSES, DataTools, ai_enabled, brief_model, chat_model, generate_brief,
                           get_client, run_chat)
 from data_sources import ALL_SECTORS, load_all, offline, run_diagnostics, secret
+
+
+def _record_banking_sources(module):
+    """Keep the source status of the Banking data so the Data Sources tab can list it."""
+    original = getattr(module, "load_banking", None)
+    if original is None or getattr(original, "_records_status", False):
+        return
+
+    def wrapped(*args, **kwargs):
+        out = original(*args, **kwargs)
+        if isinstance(out, dict) and isinstance(out.get("status"), pd.DataFrame):
+            st.session_state["_banking_sources"] = out["status"]
+        return out
+    wrapped._records_status = True
+    module.load_banking = wrapped
+
+
+for _m in (banking_ui, batch_ui):
+    _record_banking_sources(_m)
 
 st.set_page_config(page_title="Synoptic BI", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
 
@@ -51,8 +66,6 @@ html, body, [class*="css"], .stApp { font-family: 'Inter', system-ui, sans-serif
 .stTabs [aria-selected="true"] { background:#0b1f3a; color:#fff !important; }
 .stTabs [aria-selected="true"] p, .stTabs [data-baseweb="tab"] p { color:inherit !important; }
 .kpi-row-gap { height: .5rem; }
-.read-line { margin:10px 0 6px 0; padding:10px 14px; border-left:4px solid #0e7490; background:rgba(14,116,144,.08);
-  border-radius:0 10px 10px 0; font-size:.9rem; }
 .site-footer { text-align:center; color:#94a3b8; font-size:.8rem; margin-top:36px; }
 </style>
 """,
@@ -102,9 +115,6 @@ hero(pill_html)
 # One-click role presets. Each sets every slider so the result is predictable. Banking sliders live in the Banking tab.
 PRESETS = {
     "Custom (my own settings)": None,
-    "↩ Reset to defaults": {"w_lq": 30, "w_gdp": 20, "w_inc": 30, "w_edu": 20, "income_floor": 40000,
-                           "bachelor_floor": 15, "bk_w1": 40, "bk_w2": 40, "bk_w3": 20,
-                           "note": "Back to the standard weights and filters."},
     "🏦 Banking expansion": {
         "w_lq": 0, "w_gdp": 40, "w_inc": 30, "w_edu": 30, "income_floor": 40000, "bachelor_floor": 15,
         "bk_w1": 20, "bk_w2": 50, "bk_w3": 30,
@@ -114,10 +124,9 @@ PRESETS = {
         "w_lq": 20, "w_gdp": 30, "w_inc": 0, "w_edu": 50, "income_floor": 30000, "bachelor_floor": 25,
         "note": "50% bachelor's+ attainment, 30% GDP growth, 20% sector concentration. Minimum bachelor's 25%."},
     "💎 Wealth management": {
-        "w_lq": 0, "w_gdp": 40, "w_inc": 60, "w_edu": 0, "income_floor": 90000, "bachelor_floor": 0,
-        "note": "60% median income, 40% growth, markets with median income of $90k or more. Raise the income minimum "
-                "to $140k to see only the very highest-income markets (that leaves very few). Population growth is not "
-                "in the data, so GDP growth stands in for it."},
+        "w_lq": 0, "w_gdp": 40, "w_inc": 60, "w_edu": 0, "income_floor": 140000, "bachelor_floor": 0,
+        "note": "60% median income (minimum $140k), 40% growth. Population growth is not in the data, so GDP growth "
+                "stands in for it."},
 }
 
 
@@ -127,11 +136,6 @@ def _apply_preset() -> None:
         for k, v in cfg.items():
             if k != "note":
                 st.session_state[k] = v
-
-
-def _reset_all() -> None:
-    st.session_state["preset"] = "↩ Reset to defaults"
-    _apply_preset()
 
 
 st.sidebar.markdown("### 🎛️ Filters")
@@ -161,11 +165,7 @@ if total_w == 0:
 if not all_live:
     samples = ", ".join(status.loc[status["State"] != "Live", "Source"])
     missing = [k for k in ("CENSUS_API_KEY", "BEA_API_KEY") if not secret(k)]
-    seen_names = sorted(k for k in os.environ if "CENSUS" in k.upper() or "BEA" in k.upper())
-    seen_txt = ("; this server sees these setting names: " + ", ".join(repr(k) for k in seen_names)) if seen_names \
-        else "; this server sees no setting whose name contains CENSUS or BEA"
-    tip = (f" Missing keys: {', '.join(missing)} (both are free). Add them in your host's secrets or environment "
-           f"settings, then redeploy and click Refresh live data{seen_txt}."
+    tip = (f" Missing keys: {', '.join(missing)} (both are free). Add them in Secrets, then click Refresh live data."
            if missing else " Open the Data Sources tab and run the connection check to see exactly what failed.")
     st.warning(f"Sample data in use for: {samples}. Rankings are illustrative until those sources are live." + tip)
 
@@ -199,9 +199,7 @@ view = (
 view.insert(0, "rank", view.index + 1)
 
 if view.empty:
-    st.warning("⚠️ No markets match your filters, so there is nothing to show. Lower the income or education minimum "
-               "in the sidebar, or reset everything with the button below.")
-    st.button("↩ Reset filters and weights", type="primary", on_click=_reset_all)
+    st.warning("⚠️ No markets match your filters. Lower the income or education minimums in the sidebar.")
     st.stop()
 
 
@@ -212,7 +210,7 @@ def kpi(label: str, value: str, sub: str = "") -> str:
 
 top = view.iloc[0]
 k1, k2, k3, k4 = st.columns(4)
-k1.markdown(kpi("Top market", top["city"], f'Score {top["BI_Score"]:.0f} / 100 · {rating(top["BI_Score"])}'), unsafe_allow_html=True)
+k1.markdown(kpi("Top market", top["city"], f'Score {top["BI_Score"]:.0f} / 100'), unsafe_allow_html=True)
 k2.markdown(kpi("Markets matching", f"{len(view)} of {len(df)}", selected_sector.split(" (")[0]), unsafe_allow_html=True)
 k3.markdown(kpi("Avg median income", f'${view["median_income"].mean():,.0f}', "across matching markets"), unsafe_allow_html=True)
 k4.markdown(kpi("Avg GDP growth", f'{view["gdp_growth_pct"].mean():.1f}%', "county-level"), unsafe_allow_html=True)
@@ -234,7 +232,6 @@ ai_tools = DataTools(
 
 # ------------------------------------------------------------------ OVERVIEW
 with tab_over:
-    guide_market(st)
     c_map, c_rank = st.columns([6, 5], gap="large")
 
     with c_map:
@@ -274,7 +271,6 @@ with tab_over:
             ).properties(height=max(260, 30 * len(view)))
         )
         st.altair_chart(chart, width="stretch")
-        st.markdown(band_legend_html(), unsafe_allow_html=True)
 
     st.markdown("---")
     st.markdown('<div class="section-title">🔎 Market spotlight</div>'
@@ -283,13 +279,10 @@ with tab_over:
     row = view[view["city"] == pick].iloc[0]
     s1, s2, s3, s4, s5 = st.columns(5)
     s1.metric("Rank", f'#{int(row["rank"])} of {len(view)}')
-    s2.metric("Score", f'{row["BI_Score"]:.0f} · {rating(row["BI_Score"])}')
+    s2.metric("Score", f'{row["BI_Score"]:.0f}')
     s3.metric("Median income", f'${row["median_income"]:,.0f}')
     s4.metric("GDP growth", "n/a" if pd.isna(row["gdp_growth_pct"]) else f'{row["gdp_growth_pct"]:.1f}%')
     s5.metric("Bachelor's+", f'{row["highly_educated_pct"]:.0f}%')
-    _lab, _col, _mean = band(row["BI_Score"])
-    st.markdown(f'<div class="read-line" style="border-left-color:{_col}"><b>{escape(_lab)} ({row["BI_Score"]:.0f}/100):</b> {escape(_mean)} '
-                f'{escape(driver_sentence(row, parts, total_w))}</div>', unsafe_allow_html=True)
     contrib = pd.DataFrame({"Component": list(parts), "Points": [row[f"c_{n}"] for n in parts]})
     bars = (alt.Chart(contrib).mark_bar(cornerRadiusEnd=5, color=TEAL, height=22)
             .encode(x=alt.X("Points:Q", title="Points contributed to score"),
@@ -318,14 +311,13 @@ with tab_matrix:
                 "City (A–Z)": ("city", True)}
     col, asc = sort_map[sort_by]
     mx = mx.sort_values(col, ascending=asc)
-    mx["rating"] = mx["BI_Score"].map(rating)
 
     VIEWS = {
-        "Summary": ["rank", "city", "county", "BI_Score", "rating", "median_income", "gdp_growth_pct", "highly_educated_pct", "lq"],
+        "Summary": ["rank", "city", "county", "BI_Score", "median_income", "gdp_growth_pct", "highly_educated_pct", "lq"],
         "Economy": ["city", "county", "median_income", "gdp_growth_pct", "lq", "BI_Score"],
         "Education": ["city", "edu_associate_pct", "edu_bachelor_pct", "edu_graduate_pct", "highly_educated_pct"],
         "Demographics": ["city", "county", "race_white_pct", "race_black_pct", "race_asian_pct", "race_hispanic_latino_pct"],
-        "Everything": ["rank", "city", "county", "zip_code", "BI_Score", "rating", "lq", "median_income", "gdp_growth_pct",
+        "Everything": ["rank", "city", "county", "zip_code", "BI_Score", "lq", "median_income", "gdp_growth_pct",
                        "edu_associate_pct", "edu_bachelor_pct", "edu_graduate_pct", "highly_educated_pct",
                        "race_white_pct", "race_black_pct", "race_asian_pct", "race_hispanic_latino_pct"],
     }
@@ -337,7 +329,6 @@ with tab_matrix:
         "county": cc.TextColumn("County"),
         "zip_code": cc.TextColumn("ZIP"),
         "BI_Score": cc.ProgressColumn("Opportunity score", min_value=0, max_value=100, format="%.0f"),
-        "rating": cc.TextColumn("Rating", help="80+ Exceptional, 65+ Strong, 50+ Solid, 35+ Moderate, below Weak"),
         "lq": cc.NumberColumn("Sector LQ", format="%.2f", help="Location quotient: >1 means more concentrated than the U.S."),
         "median_income": cc.NumberColumn("Median income", format="$%d"),
         "gdp_growth_pct": cc.NumberColumn("GDP growth", format="%.1f%%"),
@@ -552,50 +543,6 @@ with tab_memo:
         st.caption(f"Built at {mf['built']} from the settings you have now. Change a filter or weight, then build again "
                    "to refresh it.")
 
-    # ---- chart images for articles and slides
-    st.markdown("---")
-    st.markdown('<div class="section-title">📰 Charts for your article</div>'
-                '<div class="section-sub">Clean 1200 x 675 PNG images with the title, sources and data date built in, '
-                'ready to drop into a newsletter, post or slide. For writing help, choose '
-                '"Newsletter article outline" in the AI Analyst brief generator.</div>', unsafe_allow_html=True)
-    if not all_live:
-        st.warning("Some sources are on sample data. Do not publish these charts as fact until every source is live.")
-    if st.button("🖼️ Prepare chart images", key="chart_build"):
-        with st.spinner("Drawing charts…"):
-            try:
-                files = {"market_scores": charts_mod.market_scores_png(view, selected_sector, loaded_at)}
-                ctx_b = st.session_state.get("banking_ctx")
-                if ctx_b:
-                    tb = ctx_b["table"]
-                    files["banking_opportunity"] = charts_mod.banking_opportunity_png(
-                        tb, ctx_b["small_def"], ctx_b.get("catch_label", f'{ctx_b["radius"]} mi'), loaded_at)
-                    r0 = tb.iloc[0]
-                    ring0 = (ctx_b.get("catchments") or {}).get(r0["zip_code"])
-                    nb0 = catchment_branches(ctx_b["branches"], r0["latitude"], r0["longitude"], ctx_b["radius"], ring0)
-                    if not nb0.empty:
-                        hhi_txt = (f'{str(r0["hhi_label"]).lower()} (HHI {r0["hhi_used"]:,.0f})'
-                                   if pd.notna(r0["hhi_used"]) else "deposit concentration n/a")
-                        files["deposit_share"] = charts_mod.deposit_share_png(
-                            bank_share(nb0), f'{r0["city"]} ({r0["zip_code"]})',
-                            ctx_b.get("catch_label", f'{ctx_b["radius"]} mi'), hhi_txt, loaded_at)
-                st.session_state["chart_files"] = files
-            except Exception as exc:  # noqa: BLE001
-                st.session_state.pop("chart_files", None)
-                st.error(f"Could not draw the charts ({type(exc).__name__}: {exc}). If this mentions matplotlib, "
-                         "add matplotlib to requirements.txt.")
-    cf = st.session_state.get("chart_files")
-    if cf:
-        names = {"market_scores": "Markets ranked by score", "banking_opportunity": "Banking opportunity by ZIP",
-                 "deposit_share": "Deposit share around the top ZIP"}
-        for key, label in names.items():
-            if key in cf:
-                st.image(cf[key], caption=label, width="stretch")
-                st.download_button(f"⬇️ Download: {label}", cf[key], file_name=f"synoptic_bi_{key}.png",
-                                   mime="image/png", key=f"dl_{key}")
-        if "banking_opportunity" not in cf:
-            st.caption("Open the 🏦 Banking tab first to include the banking charts.")
-        st.caption("Charts show the settings you have right now. Re-prepare them after changing a filter or weight.")
-
 # ------------------------------------------------------------------ BRIEF
 with tab_brief:
     st.markdown('<div class="section-title">How to use this platform</div>', unsafe_allow_html=True)
@@ -634,24 +581,35 @@ with tab_src:
     st.markdown('<div class="section-title">Data sources & freshness</div>'
                 f'<div class="section-sub">Last refreshed {loaded_at}. Cached for 6 hours; use the sidebar button to refresh.</div>',
                 unsafe_allow_html=True)
-    st.dataframe(status, hide_index=True, width="stretch",
+    rows = [status]
+    bank = st.session_state.get("_banking_sources")
+    if isinstance(bank, pd.DataFrame) and not bank.empty:
+        rows.append(bank)
+    else:
+        rows.append(pd.DataFrame([
+            {"Source": s_, "Feeds": f_, "State": "Not loaded", "Detail": "Loads when the Banking tab runs"}
+            for s_, f_ in (("Census CBP", "Small businesses by ZIP and size"),
+                           ("FDIC Summary of Deposits", "Bank branches and deposits"),
+                           ("Census ACS (population)", "Residents per ZIP"))]))
+    try:
+        from routing import ors_key
+        has_ors = bool(ors_key())
+    except Exception:  # noqa: BLE001
+        has_ors = False
+    rows.append(pd.DataFrame([
+        {"Source": "OpenRouteService", "Feeds": "Drive-time areas (Banking tab)",
+         "State": "Key set" if has_ors else "Not set up",
+         "Detail": "Used when Drive time is selected" if has_ors else "Straight-line radius is used instead"},
+        {"Source": "Anthropic Claude", "Feeds": "AI Analyst, briefs and memos",
+         "State": "Enabled" if ai_enabled() else "Not set up",
+         "Detail": "AI features available" if ai_enabled() else "AI features are hidden"},
+    ]))
+    all_sources = pd.concat(rows, ignore_index=True)
+    all_sources = all_sources[[c for c in ("Source", "Feeds", "State", "Detail") if c in all_sources.columns]]
+    st.dataframe(all_sources, hide_index=True, width="stretch",
                  column_config={"State": st.column_config.TextColumn("State", width="small")})
     if offline():
         st.info("Offline mode is on (SYNOPTIC_OFFLINE). Live fetching is disabled.")
-    st.markdown(
-        "**Make everything live**\n"
-        "- **Census (ACS and Business Patterns):** a free key is REQUIRED; Census rejects requests without one. "
-        "Get it at api.census.gov/data/key_signup.html and set `CENSUS_API_KEY`.\n"
-        "- **BLS QCEW:** open data, no key. If it fails from your host, set `BLS_CONTACT_EMAIL` (BLS asks "
-        "automated clients to identify a contact).\n"
-        "- **BEA GDP:** needs a free key from apps.bea.gov/API/signup. Set `BEA_API_KEY`.\n\n"
-        "- **Banking tab:** small-business counts come from Census CBP and need `CENSUS_API_KEY`; bank branches come "
-        "from the FDIC Summary of Deposits. If FDIC asks for a key, a free api.data.gov key goes in `FDIC_API_KEY`.\n"
-        "- **AI Analyst:** set `ANTHROPIC_API_KEY` (Claude Console). Optional: `AI_CHAT_MODEL` and `AI_BRIEF_MODEL` "
-        "to change the models.\n\n"
-        "Set keys in `.streamlit/secrets.toml` locally or in your host's secrets settings."
-    )
-    st.caption(f"AI Analyst: {'enabled' if ai_enabled() else 'disabled (no ANTHROPIC_API_KEY)'}")
 
     st.markdown("---")
     st.markdown('<div class="section-title">🩺 Connection check</div>'
@@ -663,6 +621,6 @@ with tab_src:
     if "diag" in st.session_state:
         st.dataframe(st.session_state["diag"], hide_index=True, width="stretch")
 
-st.markdown('<div class="site-footer">© Synoptic BI · Data: U.S. Census Bureau (ACS), Bureau of Labor Statistics '
-            '(QCEW), Bureau of Economic Analysis. For informational purposes only; not legal or investment advice.</div>',
+st.markdown('<div class="site-footer">© Synoptic BI · Data: U.S. Census Bureau (ACS, County Business Patterns), '
+            'Bureau of Labor Statistics (QCEW), Bureau of Economic Analysis, FDIC. For informational purposes only; not legal or investment advice.</div>',
             unsafe_allow_html=True)
